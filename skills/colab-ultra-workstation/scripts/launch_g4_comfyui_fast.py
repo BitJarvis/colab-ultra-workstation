@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -163,6 +164,15 @@ MODEL_COMPAT_ALIASES: list[tuple[str, str, str, str]] = [
     ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors"),
     ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
     ("model_patches", "minimax_h3_fun_controlnet_union_pruned_int8_convrot.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+    # Subgraph & auxiliary template aliases (ControlNet Union pose/detector & Music-3 template placeholders)
+    ("checkpoints", "sdpose_wholebody_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "rt_detr_v4-x-hgnet_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "rt_detr_v4-x-hgnet_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_music3_dit_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "minimax_music3_dit_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("text_encoders", "minimax_music3_text_encoder_pruned_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("clip", "minimax_music3_text_encoder_pruned_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("vae", "minimax_music3_dav.safetensors", "vae", "minimax_h3_audio_vae_fp32.safetensors"),
 ]
 
 
@@ -649,6 +659,242 @@ def start_caddy_auth_gateway(service_port: int = 8188, public_port: int = 18188)
     return creds
 
 
+def start_g4_local_queue_worker_daemon(comfy_port: int = 8188) -> None:
+    """Start a persistent self-driven queue worker inside the G4 VM so `serverless_queue/pending` jobs are consumed even without a host watcher."""
+    worker_script = Path("/tmp/g4_local_queue_worker.py")
+    worker_code = f'''#!/usr/bin/env python3
+"""In-VM Serverless Queue Consumer for G4 (`comfy-g4`) with Drive v3 API + FUSE Dual Discovery & Input Image Sync."""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+QUEUE_ROOT = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue")
+INPUT_ROOT = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/input")
+GACHA_SCRIPT = Path("/content/comfy_gacha_and_gcp.py")
+if not GACHA_SCRIPT.exists():
+    alt = Path("/content/drive/MyDrive/AI_Workstation/scripts/comfy_gacha_and_gcp.py")
+    if alt.exists():
+        GACHA_SCRIPT = alt
+
+for _sub in ("pending", "running", "completed", "failed"):
+    (QUEUE_ROOT / _sub).mkdir(parents=True, exist_ok=True)
+INPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+_FOLDER_IDS: dict[str, str] = {{}}
+
+
+def _get_token() -> str:
+    req = urllib.request.Request(
+        "http://127.0.0.1:8012/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={{"Metadata-Flavor": "Google"}},
+    )
+    return json.loads(urllib.request.urlopen(req, timeout=4).read().decode())["access_token"]
+
+
+def _sync_pending_from_drive_api() -> None:
+    """Pull newly created `pending/job_*.json` via Drive v3 API if FUSE directory cache on G4 hasn't refreshed yet."""
+    try:
+        tok = _get_token()
+        if "pending" not in _FOLDER_IDS:
+            q_f = (
+                "trashed = false and mimeType = 'application/vnd.google-apps.folder' and "
+                "(name = 'serverless_queue' or name = 'pending' or name = 'running' or name = 'completed' or name = 'failed')"
+            )
+            p_f = urllib.parse.urlencode({{"q": q_f, "fields": "files(id,name,parents)", "pageSize": 50}})
+            r_f = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files?{{p_f}}",
+                headers={{"Authorization": f"Bearer {{tok}}"}},
+            )
+            flist = json.loads(urllib.request.urlopen(r_f, timeout=5).read().decode()).get("files", [])
+            sq_ids = {{f["id"] for f in flist if f.get("name") == "serverless_queue"}}
+            for f in flist:
+                if f.get("name") in ("pending", "running", "completed", "failed"):
+                    parents = set(f.get("parents") or [])
+                    if not sq_ids or (parents & sq_ids):
+                        _FOLDER_IDS[f["name"]] = f["id"]
+        pend_id = _FOLDER_IDS.get("pending")
+        if not pend_id:
+            return
+        p_j = urllib.parse.urlencode({{
+            "q": f"trashed = false and '{{pend_id}}' in parents and name contains 'job_'",
+            "fields": "files(id,name)",
+            "pageSize": 20,
+        }})
+        r_j = urllib.request.Request(
+            f"https://www.googleapis.com/drive/v3/files?{{p_j}}",
+            headers={{"Authorization": f"Bearer {{tok}}"}},
+        )
+        jfiles = json.loads(urllib.request.urlopen(r_j, timeout=5).read().decode()).get("files", [])
+        for jf in jfiles:
+            jname = jf.get("name", "")
+            if not (jname.startswith("job_") and jname.endswith(".json")):
+                continue
+            if any((QUEUE_ROOT / st / jname).exists() for st in ("pending", "running", "completed", "failed")):
+                continue
+            r_dl = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{{jf['id']}}?alt=media",
+                headers={{"Authorization": f"Bearer {{tok}}"}},
+            )
+            raw = urllib.request.urlopen(r_dl, timeout=8).read()
+            jdata = json.loads(raw.decode("utf-8"))
+            if jdata.get("status") == "pending":
+                dst = QUEUE_ROOT / "pending" / jname
+                dst.write_bytes(raw)
+    except Exception:
+        pass
+
+
+def _ensure_workflow_inputs_synced(prompt: dict) -> None:
+    """Ensure any custom images/videos referenced by `LoadImage` / `VHS_LoadVideo` exist on G4's `input/`, pulling via Drive v3 API if needed."""
+    if not isinstance(prompt, dict):
+        return
+    needed = set()
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs") or {{}}
+        for k in ("image", "video", "audio"):
+            val = inputs.get(k)
+            if isinstance(val, str) and "." in val and "/" not in val:
+                needed.add(val)
+    missing = [name for name in needed if not (INPUT_ROOT / name).exists()]
+    if not missing:
+        return
+    try:
+        tok = _get_token()
+        for fname in missing:
+            escaped = fname.replace("'", "\\'")
+            p = urllib.parse.urlencode({{"q": f"trashed = false and name = '{{escaped}}'", "fields": "files(id,name,size)", "pageSize": 5}})
+            r = urllib.request.Request(f"https://www.googleapis.com/drive/v3/files?{{p}}", headers={{"Authorization": f"Bearer {{tok}}"}})
+            files = json.loads(urllib.request.urlopen(r, timeout=5).read().decode()).get("files", [])
+            if files:
+                fid = files[0]["id"]
+                r_dl = urllib.request.Request(f"https://www.googleapis.com/drive/v3/files/{{fid}}?alt=media", headers={{"Authorization": f"Bearer {{tok}}"}})
+                (INPUT_ROOT / fname).write_bytes(urllib.request.urlopen(r_dl, timeout=20).read())
+                print(f"⚡ [G4-Input-Sync] 已通过 Drive API 同步输入素材: {{fname}}", flush=True)
+    except Exception:
+        pass
+
+
+def _claim_next_job() -> tuple[Path, dict] | None:
+    _sync_pending_from_drive_api()
+    jobs = sorted((QUEUE_ROOT / "pending").glob("job_*.json"), key=lambda p: p.name)
+    for target in jobs:
+        try:
+            running_dst = QUEUE_ROOT / "running" / target.name
+            if running_dst.exists() or (QUEUE_ROOT / "completed" / target.name).exists():
+                target.unlink(missing_ok=True)
+                continue
+            data = json.loads(target.read_text(encoding="utf-8"))
+            if data.get("status") not in (None, "pending"):
+                continue
+            data["status"] = "running"
+            data["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            data["started_at_ms"] = int(time.time() * 1000)
+            running_dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            target.unlink(missing_ok=True)
+            return running_dst, data
+        except Exception:
+            continue
+    return None
+
+
+def main() -> None:
+    print("🚀 [G4-Queue-Worker] G4 实例内置队列消费守护进程已启动...", flush=True)
+    while True:
+        try:
+            # Wait until local ComfyUI 8188 is ready
+            urllib.request.urlopen("http://127.0.0.1:{comfy_port}/system_stats", timeout=2)
+            claimed = _claim_next_job()
+            if not claimed:
+                time.sleep(3)
+                continue
+            running_file, job = claimed
+            job_id = str(job.get("job_id") or job.get("prompt_id") or "job")
+            gacha_runs = max(1, int(job.get("gacha_runs") or 1))
+            seed_base = job.get("seed_base")
+            prefix = job.get("prefix") or f"WebUI_{{job_id[:8]}}"
+            prompt = job.get("prompt") or {{}}
+            _ensure_workflow_inputs_synced(prompt)
+            tmp_wf = Path(f"/tmp/g4_worker_{{job_id}}.json")
+            tmp_wf.write_text(json.dumps(prompt, indent=2, ensure_ascii=False), encoding="utf-8")
+            cmd = [
+                sys.executable,
+                "-u",
+                str(GACHA_SCRIPT),
+                "gacha",
+                "--workflow",
+                str(tmp_wf),
+                "--gacha-runs",
+                str(gacha_runs),
+                "--prefix",
+                str(prefix),
+                "--api-url",
+                "http://127.0.0.1:{comfy_port}",
+            ]
+            if seed_base is not None:
+                cmd.extend(["--seed-base", str(int(seed_base))])
+            elif gacha_runs == 1:
+                cmd.append("--preserve-workflow-seed")
+            print(f"🎬 [G4-Queue-Worker] 开始执行任务 {{job_id}} (gacha_runs={{gacha_runs}})...", flush=True)
+            proc = subprocess.run(cmd, text=True, capture_output=True)
+            tmp_wf.unlink(missing_ok=True)
+            out_txt = (proc.stdout or "") + "\\n" + (proc.stderr or "")
+            if proc.returncode == 0:
+                parsed = {{}}
+                for ln in reversed(out_txt.splitlines()):
+                    ln = ln.strip()
+                    if ln.startswith("{{") and ln.endswith("}}"):
+                        try:
+                            parsed = json.loads(ln)
+                            break
+                        except Exception:
+                            pass
+                expected_files = [Path(vp).name for vp in (parsed.get("take_videos") or [])]
+                if parsed.get("grid_video"):
+                    expected_files.append(Path(parsed["grid_video"]).name)
+                job["status"] = "completed"
+                job["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                job["completed_at_ms"] = int(time.time() * 1000)
+                job["expected_files"] = expected_files
+                if isinstance(parsed.get("outputs"), dict) and parsed["outputs"]:
+                    job["outputs"] = parsed["outputs"]
+                dst = QUEUE_ROOT / "completed" / running_file.name
+                dst.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+                running_file.unlink(missing_ok=True)
+                print(f"🎉 [G4-Queue-Worker] 任务 {{job_id}} 完成: {{expected_files}}", flush=True)
+            else:
+                job["status"] = "failed"
+                job["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                job["completed_at_ms"] = int(time.time() * 1000)
+                job["error"] = out_txt[-1500:]
+                dst = QUEUE_ROOT / "failed" / running_file.name
+                dst.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+                running_file.unlink(missing_ok=True)
+                print(f"❌ [G4-Queue-Worker] 任务 {{job_id}} 失败: {{out_txt[-400:]}}", flush=True)
+        except Exception:
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
+'''
+    worker_script.write_text(worker_code, encoding="utf-8")
+    sh("pkill -f '/tmp/g4_local_queue_worker.py' || true")
+    w_log = open("/tmp/g4_local_queue_worker.log", "a")
+    subprocess.Popen(
+        [sys.executable, "-u", str(worker_script)],
+        stdout=w_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="G4 Tri-Parallel NVMe Fast Boot Launcher v2.2 (Hardened)")
     parser.add_argument(
@@ -731,6 +977,8 @@ def main() -> None:
         stdout=comfy_log,
         stderr=subprocess.STDOUT,
     )
+
+    start_g4_local_queue_worker_daemon(comfy_port=8188)
 
     auth_creds = None
     if not args.no_tunnel:

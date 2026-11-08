@@ -381,6 +381,11 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                 ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_bf16.safetensors"),
                 ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_bf16.safetensors"),
                 ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+                ("checkpoints", "sdpose_wholebody_fp16.safetensors"),
+                ("unet", "rt_detr_v4-x-hgnet_fp16.safetensors"),
+                ("unet", "minimax_music3_dit_fp16.safetensors"),
+                ("clip", "minimax_music3_text_encoder_pruned_int8_convrot.safetensors"),
+                ("vae", "minimax_music3_dav.safetensors"),
             ]
             for sub, alias_rel in expected_aliases:
                 self.assertTrue((fake_local_models_cpu / sub / alias_rel).exists(), f"Missing CPU alias {sub}/{alias_rel}")
@@ -395,6 +400,22 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
         # 1c. Verify `_format_gacha_prefix` preserves subfolder prefixes like `video/MiniMax_H3`
         formatted_sub = gacha._format_gacha_prefix("video/MiniMax_H3", "GachaT01_S1001", base_prefix="WebUI_b8e0b962")
         self.assertEqual(formatted_sub, "video/WebUI_b8e0b962_MiniMax_H3_GachaT01_S1001")
+
+        # 1d. Verify `mutate_workflow_for_gacha_take(..., take_seed=None)` preserves the user's exact workflow seed
+        webui_single_wf = {
+            "129": {"class_type": "RandomNoise", "inputs": {"noise_seed": 261662374822964}},
+            "92": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "video/MiniMax_H3"}},
+        }
+        mut_single, single_prefixes = gacha.mutate_workflow_for_gacha_take(
+            webui_single_wf, take_idx=1, take_seed=None, base_prefix="WebUI_b8e0b962"
+        )
+        self.assertEqual(mut_single["129"]["inputs"]["noise_seed"], 261662374822964)
+        self.assertEqual(single_prefixes, ["video/WebUI_b8e0b962_MiniMax_H3_GachaT01_S261662374822964"])
+
+        # 1e. Verify G4 launcher includes `start_g4_local_queue_worker_daemon` and CPU Canvas includes `_sync_queue_transitions_from_drive_api`
+        g4_src = (REPO_ROOT / "scripts" / "launch_g4_comfyui_fast.py").read_text(encoding="utf-8")
+        self.assertIn("def start_g4_local_queue_worker_daemon", g4_src)
+        self.assertIn("def _sync_queue_transitions_from_drive_api", cpu_src)
 
         # 2. Test `enqueue_serverless_job` validation, sanitization, and atomic file creation
         with tempfile.TemporaryDirectory() as tmpdir:

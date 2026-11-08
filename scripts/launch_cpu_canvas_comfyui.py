@@ -203,6 +203,15 @@ MODEL_COMPAT_ALIASES: list[tuple[str, str, str, str]] = [
     ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors"),
     ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
     ("model_patches", "minimax_h3_fun_controlnet_union_pruned_int8_convrot.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+    # Subgraph & auxiliary template aliases (ControlNet Union pose/detector & Music-3 template placeholders)
+    ("checkpoints", "sdpose_wholebody_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "rt_detr_v4-x-hgnet_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "rt_detr_v4-x-hgnet_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_music3_dit_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "minimax_music3_dit_fp16.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("text_encoders", "minimax_music3_text_encoder_pruned_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("clip", "minimax_music3_text_encoder_pruned_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("vae", "minimax_music3_dav.safetensors", "vae", "minimax_h3_audio_vae_fp32.safetensors"),
 ]
 
 
@@ -638,18 +647,116 @@ async def _broadcast_ws(payload: dict) -> None:
         _WS_CLIENTS.discard(ws)
 
 
+_LAST_DRIVE_QUEUE_SYNC_TS = 0.0
+_QUEUE_FOLDER_IDS: dict[str, str] = {{}}
+
+
+def _sync_queue_transitions_from_drive_api() -> None:
+    """Reconcile `pending` / `running` jobs on local FUSE against Google Drive v3 API so cross-VM state changes appear immediately."""
+    global _LAST_DRIVE_QUEUE_SYNC_TS
+    now = time.time()
+    if now - _LAST_DRIVE_QUEUE_SYNC_TS < 2.5:
+        return
+    local_active = list((QUEUE_ROOT / "pending").glob("job_*.json")) + list((QUEUE_ROOT / "running").glob("job_*.json"))
+    if not local_active and (now - _LAST_DRIVE_QUEUE_SYNC_TS < 10.0):
+        return
+    _LAST_DRIVE_QUEUE_SYNC_TS = now
+    try:
+        import urllib.parse
+        import urllib.request
+
+        req_tok = urllib.request.Request(
+            "http://127.0.0.1:8012/computeMetadata/v1/instance/service-accounts/default/token",
+            headers={{"Metadata-Flavor": "Google"}},
+        )
+        tok = json.loads(urllib.request.urlopen(req_tok, timeout=3).read().decode())["access_token"]
+        if len(_QUEUE_FOLDER_IDS) < 4:
+            q_folders = (
+                "trashed = false and mimeType = 'application/vnd.google-apps.folder' and "
+                "(name = 'serverless_queue' or name = 'pending' or name = 'running' or name = 'completed' or name = 'failed')"
+            )
+            p_f = urllib.parse.urlencode({{"q": q_folders, "fields": "files(id,name,parents)", "pageSize": 50}})
+            r_f = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files?{{p_f}}",
+                headers={{"Authorization": f"Bearer {{tok}}"}},
+            )
+            flist = json.loads(urllib.request.urlopen(r_f, timeout=5).read().decode()).get("files", [])
+            sq_ids = {{f["id"] for f in flist if f.get("name") == "serverless_queue"}}
+            for f in flist:
+                if f.get("name") in ("pending", "running", "completed", "failed"):
+                    parents = set(f.get("parents") or [])
+                    if not sq_ids or (parents & sq_ids):
+                        _QUEUE_FOLDER_IDS[f["id"]] = f["name"]
+
+        p_j = urllib.parse.urlencode({{
+            "q": "trashed = false and name contains 'job_' and name contains '.json'",
+            "fields": "files(id,name,parents,modifiedTime)",
+            "orderBy": "modifiedTime desc",
+            "pageSize": 30,
+        }})
+        r_j = urllib.request.Request(
+            f"https://www.googleapis.com/drive/v3/files?{{p_j}}",
+            headers={{"Authorization": f"Bearer {{tok}}"}},
+        )
+        jfiles = json.loads(urllib.request.urlopen(r_j, timeout=5).read().decode()).get("files", [])
+        seen_names: set[str] = set()
+        for jf in jfiles:
+            jname = jf.get("name", "")
+            if not (jname.startswith("job_") and jname.endswith(".json")) or jname in seen_names:
+                continue
+            parents = jf.get("parents") or []
+            cloud_st = None
+            for pid in parents:
+                if pid in _QUEUE_FOLDER_IDS:
+                    cloud_st = _QUEUE_FOLDER_IDS[pid]
+                    break
+            seen_names.add(jname)
+            target_local = (QUEUE_ROOT / cloud_st / jname) if cloud_st else None
+            need_pull = False
+            if cloud_st in ("running", "completed", "failed") and (
+                not target_local.exists()
+                or (QUEUE_ROOT / "pending" / jname).exists()
+                or (cloud_st in ("completed", "failed") and (QUEUE_ROOT / "running" / jname).exists())
+            ):
+                need_pull = True
+            if need_pull:
+                r_dl = urllib.request.Request(
+                    f"https://www.googleapis.com/drive/v3/files/{{jf['id']}}?alt=media",
+                    headers={{"Authorization": f"Bearer {{tok}}"}},
+                )
+                raw_bytes = urllib.request.urlopen(r_dl, timeout=8).read()
+                jdata = json.loads(raw_bytes.decode("utf-8"))
+                real_st = jdata.get("status") if jdata.get("status") in ("pending", "running", "completed", "failed") else (cloud_st or "completed")
+                dst_p = QUEUE_ROOT / real_st / jname
+                dst_p.parent.mkdir(parents=True, exist_ok=True)
+                dst_p.write_bytes(raw_bytes)
+                for other_st in ("pending", "running", "completed", "failed"):
+                    if other_st != real_st:
+                        (QUEUE_ROOT / other_st / jname).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _scan_all_serverless_jobs() -> dict[str, list[tuple[Path, dict]]]:
+    _sync_queue_transitions_from_drive_api()
     res: dict[str, list[tuple[Path, dict]]] = {{"pending": [], "running": [], "completed": [], "failed": []}}
+    seen_by_name: dict[str, tuple[str, Path, dict]] = {{}}
+    state_priority = {{"pending": 1, "running": 2, "completed": 3, "failed": 3}}
     for st in ("pending", "running", "completed", "failed"):
         files = sorted((QUEUE_ROOT / st).glob("job_*.json"), key=lambda p: p.name)
         for jf in files:
             try:
                 jdata = json.loads(jf.read_text(encoding="utf-8"))
-                if st == "completed" and not jdata.get("outputs") and jdata.get("expected_files"):
-                    jdata["outputs"] = _build_outputs_from_expected_files(jdata)
-                res[st].append((jf, jdata))
+                real_st = jdata.get("status") if jdata.get("status") in state_priority else st
+                prev = seen_by_name.get(jf.name)
+                if prev is None or state_priority[real_st] >= state_priority[prev[0]]:
+                    seen_by_name[jf.name] = (real_st, jf, jdata)
             except Exception:
                 pass
+    for real_st, jf, jdata in seen_by_name.values():
+        if real_st == "completed" and not jdata.get("outputs") and jdata.get("expected_files"):
+            jdata["outputs"] = _build_outputs_from_expected_files(jdata)
+        res[real_st].append((jf, jdata))
     return res
 
 

@@ -293,7 +293,7 @@ except Exception as e:
         self,
         workflow_path: Path,
         gacha_runs: int = 1,
-        seed_base: int = 2026110801,
+        seed_base: Optional[int] = 2026110801,
         seeds_str: Optional[str] = None,
         prefix: str = "ServerlessG4",
         target_seg_id: Optional[int] = None,
@@ -317,11 +317,13 @@ except Exception as e:
             remote_wf,
             "--gacha-runs",
             str(max(1, int(gacha_runs))),
-            "--seed-base",
-            str(int(seed_base)),
             "--prefix",
             prefix,
         ]
+        if seed_base is not None:
+            cmd_parts.extend(["--seed-base", str(int(seed_base))])
+        elif max(1, int(gacha_runs)) == 1 and not seeds_str:
+            cmd_parts.append("--preserve-workflow-seed")
         if seeds_str:
             cmd_parts.extend(["--seeds", seeds_str])
         if target_seg_id is not None:
@@ -581,7 +583,8 @@ else:
         if claimed_job:
             job_id = claimed_job.get("job_id", "unknown")
             gacha_runs = max(1, int(claimed_job.get("gacha_runs") or 1))
-            seed_base = int(claimed_job.get("seed_base") or 2026110801)
+            raw_seed_base = claimed_job.get("seed_base")
+            seed_base: Optional[int] = int(raw_seed_base) if raw_seed_base is not None else (2026110801 if gacha_runs > 1 else None)
             prefix = claimed_job.get("prefix") or f"WebUI_{job_id[:8]}"
             running_file = claimed_job.get("running_file", "")
             print(f"⚡ [Queue-Hit] 捕获到来自 0 CCU 画布的新任务: job_id={job_id} (gacha_runs={gacha_runs})！", flush=True)

@@ -126,12 +126,14 @@ def ensure_api_workflow_format(workflow: Dict[str, Any], source_hint: str = "wor
 def mutate_workflow_for_gacha_take(
     workflow: Dict[str, Any],
     take_idx: int,
-    take_seed: int,
+    take_seed: Optional[int] = None,
     base_prefix: Optional[str] = None,
     target_seg_id: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """Return a deep-copied workflow mutated with `take_seed` and take-specific output prefixes.
+    """Return a deep-copied workflow mutated with `take_seed` (if provided) and take-specific output prefixes.
 
+    If `take_seed` is None (e.g., single-run Web UI submission with `seed_base=None`), preserves the user's
+    original workflow seed values while still applying take-specific output prefixes.
     If `target_seg_id` is specified (e.g., Segment 1 uses nodes 20..39, Segment 2 uses 40..59),
     only seed nodes belonging to that segment are shifted by `take_seed`, or if `target_seg_id` is None,
     all seed nodes in the workflow are deterministically offset by `(take_seed + node_offset)`.
@@ -139,39 +141,52 @@ def mutate_workflow_for_gacha_take(
     """
     ensure_api_workflow_format(workflow)
     wf = copy.deepcopy(workflow)
-    tag = f"GachaT{take_idx:02d}_S{take_seed}"
+    first_orig_seed: Optional[int] = None
+    for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
+        node = wf[nid]
+        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+        if isinstance(inputs, dict):
+            for sk in SEED_INPUT_KEYS:
+                if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
+                    first_orig_seed = int(inputs[sk])
+                    break
+        if first_orig_seed is not None:
+            break
+    seed_tag_val = take_seed if take_seed is not None else (first_orig_seed if first_orig_seed is not None else 0)
+    tag = f"GachaT{take_idx:02d}_S{seed_tag_val}"
     expected_prefixes: List[str] = []
 
     target_noise_nid = str(target_seg_id * 20 + 5) if target_seg_id is not None else None
 
-    # 1. Update seed inputs across all sampler / noise nodes
+    # 1. Update seed inputs across all sampler / noise nodes when take_seed is explicitly provided
     seed_nodes_updated = 0
-    for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
-        node = wf[nid]
-        if not isinstance(node, dict):
-            continue
-        inputs = node.get("inputs", {})
-        if not isinstance(inputs, dict):
-            continue
-
-        if target_noise_nid is not None and str(nid) != target_noise_nid:
-            continue
-
-        for sk in SEED_INPUT_KEYS:
-            if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
-                # Keep multi-segment relative offsets distinct while anchoring on take_seed
-                inputs[sk] = int(take_seed) + seed_nodes_updated
-                seed_nodes_updated += 1
-
-    # Fallback: if target_noise_nid wasn't found in a generic workflow, update all seed nodes
-    if seed_nodes_updated == 0 and target_noise_nid is not None:
+    if take_seed is not None:
         for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
             node = wf[nid]
-            inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
+
+            if target_noise_nid is not None and str(nid) != target_noise_nid:
+                continue
+
             for sk in SEED_INPUT_KEYS:
                 if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
+                    # Keep multi-segment relative offsets distinct while anchoring on take_seed
                     inputs[sk] = int(take_seed) + seed_nodes_updated
                     seed_nodes_updated += 1
+
+        # Fallback: if target_noise_nid wasn't found in a generic workflow, update all seed nodes
+        if seed_nodes_updated == 0 and target_noise_nid is not None:
+            for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
+                node = wf[nid]
+                inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+                for sk in SEED_INPUT_KEYS:
+                    if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
+                        inputs[sk] = int(take_seed) + seed_nodes_updated
+                        seed_nodes_updated += 1
 
     # 2. Rewrite filename_prefix on SaveVideo / VHS_VideoCombine / SaveImage nodes and H3SaveAVLatent checkpoints
     for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
@@ -510,7 +525,7 @@ def submit_comfy_prompt_and_wait(workflow: Dict[str, Any], label: str, api_url: 
 
 def run_batch_gacha_workflow(
     workflow_path: Path,
-    seeds: List[int],
+    seeds: List[Optional[int]],
     base_prefix: str = "Gacha",
     target_seg_id: Optional[int] = None,
     api_url: str = DEFAULT_API_URL,
@@ -543,7 +558,7 @@ def run_batch_gacha_workflow(
             base_prefix=base_prefix,
             target_seg_id=target_seg_id,
         )
-        label = f"Gacha Take #{idx}/{len(seeds)} (seed={seed})"
+        label = f"Gacha Take #{idx}/{len(seeds)} (seed={'workflow_default' if seed is None else seed})"
         hist_entry = submit_comfy_prompt_and_wait(mut_wf, label=label, api_url=api_url)
         if isinstance(hist_entry, dict) and isinstance(hist_entry.get("outputs"), dict):
             last_outputs = hist_entry["outputs"]
@@ -565,7 +580,7 @@ def run_batch_gacha_workflow(
     grid_mp4: Optional[Path] = None
     if len(take_videos) >= 2 and all(p.suffix.lower() == ".mp4" for p in take_videos):
         grid_mp4 = out_root / f"{base_prefix}_Gacha_{len(take_videos)}way_Grid.mp4"
-        render_gacha_comparison_grid(take_videos, grid_mp4, seeds=seeds)
+        render_gacha_comparison_grid(take_videos, grid_mp4, seeds=[s for s in seeds if s is not None] or None)
 
     if gcs_bucket:
         to_sync = list(take_videos)
@@ -602,6 +617,7 @@ def main() -> None:
     p_gacha.add_argument("--gacha-runs", type=int, default=4, help="Number of gacha takes to generate (default: 4 for 2x2 grid)")
     p_gacha.add_argument("--seed-base", type=int, default=2026110801, help="Starting random seed")
     p_gacha.add_argument("--seeds", default=None, help="Explicit comma-separated seed list, e.g. '101,202,303,404'")
+    p_gacha.add_argument("--preserve-workflow-seed", action="store_true", help="Preserve the workflow's original seed when running a single take")
     p_gacha.add_argument("--prefix", default="ComfyGacha", help="Output filename prefix")
     p_gacha.add_argument("--target-seg", type=int, default=None, help="Optional MiniMax-H3 segment ID to target")
     p_gacha.add_argument("--api-url", default=DEFAULT_API_URL, help="ComfyUI HTTP API URL (default: http://127.0.0.1:8188)")
@@ -635,7 +651,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "gacha":
-        seeds = parse_seed_list(args.seeds, seed_base=args.seed_base, gacha_runs=args.gacha_runs)
+        if args.preserve_workflow_seed and args.gacha_runs == 1 and not args.seeds:
+            seeds: List[Optional[int]] = [None]
+        else:
+            seeds = list(parse_seed_list(args.seeds, seed_base=args.seed_base, gacha_runs=args.gacha_runs))
         out_dir = Path(args.output_dir) if args.output_dir else None
         res = run_batch_gacha_workflow(
             workflow_path=Path(args.workflow),
@@ -652,8 +671,8 @@ def main() -> None:
 
     elif args.cmd == "grid":
         vids = [Path(v) for v in args.videos]
-        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()] if args.seeds else None
-        render_gacha_comparison_grid(vids, Path(args.out), seeds=seeds, tile_w=args.tile_w, tile_h=args.tile_h)
+        seeds_int = [int(s.strip()) for s in args.seeds.split(",") if s.strip()] if args.seeds else None
+        render_gacha_comparison_grid(vids, Path(args.out), seeds=seeds_int, tile_w=args.tile_w, tile_h=args.tile_h)
 
     elif args.cmd == "gcs-push":
         srcs = [Path(s) for s in args.src]
