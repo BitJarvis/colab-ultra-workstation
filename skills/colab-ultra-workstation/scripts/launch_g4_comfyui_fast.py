@@ -936,9 +936,25 @@ def main() -> None:
             if _is_comfy_locally_busy() or list((QUEUE_ROOT / "running").glob("job_*.json")):
                 last_active_ts = time.time()
 
+            # Refresh last_files from the most recently completed job in case c6e1c7 watcher executed it
+            try:
+                comp_jobs = sorted((QUEUE_ROOT / "completed").glob("job_*.json"), key=lambda p: p.name)
+                if comp_jobs:
+                    latest_comp = json.loads(comp_jobs[-1].read_text(encoding="utf-8"))
+                    if latest_comp.get("expected_files"):
+                        last_files = [Path(f).name for f in latest_comp["expected_files"]]
+            except Exception:
+                pass
+
             claimed = _claim_next_job()
             if not claimed:
                 idle_for = time.time() - last_active_ts
+                # If c6e1c7 watcher hasn't updated STATE_FILE in >30s, keep STATE_FILE fresh from G4
+                try:
+                    if not STATE_FILE.exists() or (int(time.time() * 1000) - int(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("updated_at_ms") or 0)) > 30000:
+                        _update_drive_runtime_state("executing" if _is_comfy_locally_busy() else "ready_warm", idle_for, idle_limit)
+                except Exception:
+                    pass
                 if idle_limit > 0 and idle_for >= idle_limit and not _is_comfy_locally_busy():
                     _self_unassign_g4(idle_for, idle_limit, last_files)
                 time.sleep(3)

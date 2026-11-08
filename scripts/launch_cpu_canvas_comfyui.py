@@ -1394,17 +1394,31 @@ def ensure_cloud_autonomous_watcher_on_cpu_vm(
         else:
             return None
 
+    target_arg_str = f"--cpu-session {cpu_session} --g4-session {g4_session} --idle-timeout {int(idle_timeout)}"
     try:
-        out_pids = subprocess.getoutput("pgrep -f 'comfy_serverless_g4_dispatcher.py watch'")
-        for raw_pid in out_pids.splitlines():
-            raw_pid = raw_pid.strip()
-            if raw_pid.isdigit():
-                pid_int = int(raw_pid)
-                if pid_int != os.getpid():
-                    try:
-                        os.kill(pid_int, 9)
-                    except OSError:
-                        pass
+        out_procs = subprocess.getoutput("pgrep -af 'comfy_serverless_g4_dispatcher.py watch'")
+        existing_match_pid = None
+        for line in out_procs.splitlines():
+            parts = line.strip().split(None, 1)
+            if not parts or not parts[0].isdigit():
+                continue
+            pid_int = int(parts[0])
+            if pid_int == os.getpid():
+                continue
+            cmdline = parts[1] if len(parts) > 1 else ""
+            if target_arg_str in cmdline and existing_match_pid is None:
+                existing_match_pid = pid_int
+            else:
+                try:
+                    os.kill(pid_int, 9)
+                except OSError:
+                    pass
+        if existing_match_pid is not None:
+            print(
+                f"♻️ [Cloud-Autonomous-Watcher] 复用已在运行的 G4 自动启停守护进程 (PID={existing_match_pid}, idle_timeout={idle_timeout}s)",
+                flush=True,
+            )
+            return existing_match_pid
     except Exception:
         pass
     w_log = open(f"/tmp/serverless_g4_watcher_{cpu_session}.log", "a")

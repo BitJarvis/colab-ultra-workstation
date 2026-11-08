@@ -636,6 +636,27 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                     self.assertEqual(rc_to, 124)
                     self.assertEqual(out_to, "TIMEOUT")
                     self.assertFalse(local_ctrl.is_session_alive("comfy-g4"))
+                    with self.assertRaises(RuntimeError) as ctx_up:
+                        local_ctrl.colab_upload("comfy-g4", src_f, "/content/dst.txt", timeout=1.0)
+                    self.assertIn("TIMEOUT", str(ctx_up.exception))
+
+                    # Verify `is_g4_comfy_ready` restores `last_activity_ts` from persisted state if watcher restarts while G4 is warm
+                    saved_act_ts = disp.time.time() - 180.0
+                    disp.G4_LOCAL_STATE_FILE.write_text(
+                        json.dumps({"g4_state": "ready_warm", "last_activity_ts": saved_act_ts}),
+                        encoding="utf-8",
+                    )
+                    restart_ctrl = disp.ServerlessG4LifecycleController(
+                        g4_session="comfy-g4",
+                        cpu_session="c6e1c7",
+                        gpu_variant="G4",
+                        idle_timeout_sec=600,
+                        runner=lambda cmd, stdin_text=None, timeout=60.0: (
+                            (0, "[comfy-g4] Hardware: G4") if "sessions" in cmd else (0, "COMFY_READY_OK")
+                        ),
+                    )
+                    self.assertTrue(restart_ctrl.is_g4_comfy_ready())
+                    self.assertAlmostEqual(restart_ctrl.last_activity_ts, saved_act_ts, delta=1.0)
 
                     # Verify `sync_colab_cli_to_cpu_session` syncs credentials with 0600 permissions and never touches Drive
                     fake_cfg = state_dir / "colab-cli"

@@ -189,7 +189,10 @@ class ServerlessG4LifecycleController:
             if local_path.resolve() != dst.resolve():
                 shutil.copy2(local_path, dst)
             return
-        rc, out = self._runner([COLAB_BIN, "upload", "-s", sess, str(local_path), remote_path], None, timeout)
+        try:
+            rc, out = self._runner([COLAB_BIN, "upload", "-s", sess, str(local_path), remote_path], None, timeout)
+        except subprocess.TimeoutExpired:
+            rc, out = 124, "TIMEOUT"
         if rc != 0:
             raise RuntimeError(f"Failed to upload {local_path} to [{sess}]:{remote_path}: {out}")
 
@@ -226,7 +229,18 @@ class ServerlessG4LifecycleController:
         if ready and self.g4_state not in ("executing",):
             self.g4_state = "ready_warm"
             if self.last_activity_ts <= 0.0:
-                self.last_activity_ts = time.time()
+                restored_ts = 0.0
+                for cand in (G4_LOCAL_STATE_FILE, G4_DRIVE_STATE_FILE):
+                    if cand.exists():
+                        try:
+                            prev_data = json.loads(cand.read_text(encoding="utf-8"))
+                            prev_ts = float(prev_data.get("last_activity_ts") or 0.0)
+                            if 0.0 < prev_ts <= time.time():
+                                restored_ts = prev_ts
+                                break
+                        except Exception:
+                            pass
+                self.last_activity_ts = restored_ts if restored_ts > 0.0 else time.time()
         return ready
 
     def ensure_g4_ready(self, boot_timeout_sec: int = 420) -> Dict[str, Any]:
@@ -241,22 +255,31 @@ class ServerlessG4LifecycleController:
         self.write_runtime_state("booting", {"boot_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))})
         if not self.is_session_alive(self.g4_session):
             print(f"🚀 [G4-Provision] 正在按需拉起 {self.gpu_variant} (96GB Blackwell) 算力实例: [{self.g4_session}] ...", flush=True)
-            self._runner(
-                [sys.executable, str(METER_SCRIPT), "start", "-s", self.g4_session, "-g", self.gpu_variant],
-                None,
-                30.0,
-            )
-            rc, out = self._runner(
-                [COLAB_BIN, "new", "-s", self.g4_session, "--gpu", self.gpu_variant],
-                None,
-                180.0,
-            )
+            try:
+                self._runner(
+                    [sys.executable, str(METER_SCRIPT), "start", "-s", self.g4_session, "-g", self.gpu_variant],
+                    None,
+                    30.0,
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                rc, out = self._runner(
+                    [COLAB_BIN, "new", "-s", self.g4_session, "--gpu", self.gpu_variant],
+                    None,
+                    180.0,
+                )
+            except subprocess.TimeoutExpired:
+                rc, out = 124, "TIMEOUT"
             if rc != 0:
                 self.write_runtime_state("stopped", {"last_error": f"Failed to allocate {self.gpu_variant}: {out}"})
                 raise RuntimeError(f"❌ 无法分配 {self.gpu_variant} 实例 [{self.g4_session}]: {out}")
 
         print(f"☁️ [G4-Mount] 正在为 [{self.g4_session}] 零弹窗挂载 20TB/30TB Google Drive...", flush=True)
-        rc, out = self._runner([COLAB_BIN, "dfs", "mount", "-s", self.g4_session], None, 150.0)
+        try:
+            rc, out = self._runner([COLAB_BIN, "dfs", "mount", "-s", self.g4_session], None, 150.0)
+        except subprocess.TimeoutExpired:
+            rc, out = 124, "TIMEOUT"
         if rc != 0:
             self.write_runtime_state("stopped", {"last_error": f"Failed to mount Drive on {self.g4_session}: {out}"})
             raise RuntimeError(f"❌ [{self.g4_session}] 挂载 Google Drive 失败: {out}")
@@ -348,11 +371,14 @@ except Exception as e:
         """Verify Drive sync, unassign ONLY the G4 session, and output Dual-Track CCU Settlement Report."""
         print(f"🛑 [G4-AutoStop] 触发 G4 算力释放 (原因: {reason})，正在核验云盘落盘状态...", flush=True)
         self.verify_drive_flush_before_stop(expected_filenames=expected_files)
-        rc, out = self._runner(
-            [sys.executable, str(METER_SCRIPT), "stop", "-s", self.g4_session],
-            None,
-            45.0,
-        )
+        try:
+            rc, out = self._runner(
+                [sys.executable, str(METER_SCRIPT), "stop", "-s", self.g4_session],
+                None,
+                45.0,
+            )
+        except subprocess.TimeoutExpired:
+            rc, out = 124, "TIMEOUT"
         self.g4_active = False
         self.current_job_id = None
         self.write_runtime_state(
