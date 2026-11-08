@@ -6,23 +6,32 @@ Tests:
    - Verifies `in_mounts()` detection and ensures `rm -rf` is NEVER present on `/content/drive`.
    - Verifies `rmdir` is used instead of `rm -rf`.
 2. CRITICAL FIX 2 (`launch_g4_comfyui_fast.py`):
-   - Verifies `_safe_ckpt_path()` blocks path traversal (`../../etc/passwd`, `/tmp/evil.pt`, `.`, `..`, empty)
+   - Dynamically extracts `_safe_ckpt_path()` from `launch_g4_comfyui_fast.py` (never from a hardcoded copy)
+     and verifies it blocks path traversal (`../../etc/passwd`, `..\\..\\etc\\passwd`, `/tmp/evil.pt`, `.`, `..`, empty, `/`)
      and confines checkpoints strictly inside `LATENT_DIR`.
    - Verifies `start_caddy_auth_gateway()` and `--no-tunnel` are wired into `launch_g4_comfyui_fast.py`
      so port 8188 is never exposed unauthenticated to `trycloudflare.com`.
 3. CRITICAL FIX 3 (Hardcoded `/Users/delroy` removal & conditional proxy):
    - Scans the entire repository to ensure zero occurrences of `/Users/delroy`.
    - Verifies `fast_start_g4.sh` checks whether port 7890 is listening before exporting `127.0.0.1:7890`.
-4. ComfyUI Batch Video Gacha & GCP GCS Integration (`comfy_gacha_and_gcp.py`, `run_dance.py`, `run_drama.py`):
-   - Tests `parse_seed_list`, `mutate_workflow_for_gacha_take`, `build_ffmpeg_grid_command`, `validate_gcs_uri`.
+4. ComfyUI Batch Video Gacha & Multi-Segment Stitching Integration (`comfy_gacha_and_gcp.py`, `run_dance.py`, `run_drama.py`, `run_g4_v25_4seg_drama.py`):
+   - Tests `parse_seed_list`, `mutate_workflow_for_gacha_take`, `ensure_api_workflow_format`, `build_ffmpeg_grid_command`, `validate_gcs_uri`.
+   - Verifies `_SegXX` suffix preservation so multi-segment `stitch_available_segments()` in `run_dance.py` and `run_drama.py`
+     finds and stitches per-take segment MP4s (`{prefix}_GachaT01_S{seed}_Seg01*.mp4` -> `{prefix}_GachaT01_S{seed}_Master.mp4`).
+   - Verifies boolean inputs are not corrupted as integer seeds (`isinstance(True, int)` edge case) and Web UI workflows are rejected cleanly.
+5. GCS URI Validation:
+   - Verifies `validate_gcs_uri` accepts valid buckets and rejects injection/invalid URIs.
+6. FFmpeg 2x2 Grid Synthesis & Watermark:
    - Executes an end-to-end FFmpeg 2x2 gacha comparison grid synthesis test using synthetic test MP4s.
-5. Repository-wide Syntax & Compilation Check:
+7. Repository-wide Syntax & Compilation Check:
    - Compiles every `.py` file with `py_compile` and checks every `.sh` file with `bash -n`.
+8. Skill Mirror Parity Check:
+   - Verifies `skills/colab-ultra-workstation/` matches the root `SKILL.md`, `scripts/`, and `references/`.
 """
 
 from __future__ import annotations
 
-import ast
+import importlib.util
 import json
 import os
 import py_compile
@@ -38,6 +47,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import comfy_gacha_and_gcp as gacha  # noqa: E402
+
+
+def _load_module_from_path(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestWorkstationSecurityAndGacha(unittest.TestCase):
@@ -57,7 +74,7 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
             self.assertIn('rmdir "{MP}"', content, f"Missing safe rmdir in {p}")
 
     def test_02_comfyui_caddy_auth_and_safe_ckpt_path(self) -> None:
-        """Verify CRITICAL FIX 2: Caddy Auth Gateway on port 18188 + `_safe_ckpt_path` traversal prevention."""
+        """Verify CRITICAL FIX 2: Caddy Auth Gateway on port 18188 + dynamic extraction of `_safe_ckpt_path`."""
         targets = [
             REPO_ROOT / "scripts" / "launch_g4_comfyui_fast.py",
             REPO_ROOT / "skills" / "colab-ultra-workstation" / "scripts" / "launch_g4_comfyui_fast.py",
@@ -71,37 +88,38 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
             self.assertIn("def _safe_ckpt_path", content)
             self.assertIn("weights_only=True", content)
 
-        # Extract and execute `_safe_ckpt_path` in an isolated temp directory
+        # Dynamically extract the actual `_safe_ckpt_path` definition from `scripts/launch_g4_comfyui_fast.py`
+        src_text = (REPO_ROOT / "scripts" / "launch_g4_comfyui_fast.py").read_text(encoding="utf-8")
+        m = re.search(
+            r"(def _safe_ckpt_path\(checkpoint_name: str\) -> Path:.*?return candidate)",
+            src_text,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(m, "Could not extract _safe_ckpt_path from launch_g4_comfyui_fast.py")
+        extracted_code = m.group(1)
+
         with tempfile.TemporaryDirectory() as tmpdir:
             latent_dir = Path(tmpdir) / "latents"
             latent_dir.mkdir(parents=True, exist_ok=True)
 
             ns = {"Path": Path, "LATENT_DIR": latent_dir}
-            safe_fn_code = """
-def _safe_ckpt_path(checkpoint_name: str) -> Path:
-    base = LATENT_DIR.resolve()
-    clean_name = Path(str(checkpoint_name or "")).name
-    if not clean_name or clean_name in {".", ".."} or "/" in clean_name or "\\\\" in clean_name:
-        raise ValueError(f"Invalid checkpoint_name: {checkpoint_name!r}")
-    candidate = (base / clean_name).resolve()
-    if candidate.parent != base:
-        raise ValueError(f"Path traversal blocked for checkpoint_name: {checkpoint_name!r}")
-    return candidate
-"""
-            exec(safe_fn_code, ns)
+            exec(extracted_code, ns)
             _safe_ckpt_path = ns["_safe_ckpt_path"]
 
-            # Valid filename
+            # Valid filename (with and without .pt suffix)
             valid = _safe_ckpt_path("Seg01_av_latent.pt")
             self.assertEqual(valid, latent_dir.resolve() / "Seg01_av_latent.pt")
+            valid_no_ext = _safe_ckpt_path("Seg02_av_latent")
+            self.assertEqual(valid_no_ext, latent_dir.resolve() / "Seg02_av_latent.pt")
 
-            # Traversal attempts get stripped to basename or rejected
-            stripped = _safe_ckpt_path("../../etc/passwd")
-            self.assertEqual(stripped.parent, latent_dir.resolve())
-            self.assertEqual(stripped.name, "passwd")
+            # Unix & Windows traversal attempts get stripped to basename inside LATENT_DIR
+            for attempt in ("../../etc/passwd", "..\\..\\etc\\passwd", "/tmp/evil.pt"):
+                confined = _safe_ckpt_path(attempt)
+                self.assertEqual(confined.parent, latent_dir.resolve())
+                self.assertIn(confined.name, ("passwd.pt", "evil.pt"))
 
-            for bad in ("", ".", "..", "/"):
-                with self.assertRaises(ValueError):
+            for bad in ("", "   ", ".", "..", "/", "\\", "foo/bar/"):
+                with self.assertRaises(ValueError, msg=f"Expected ValueError for {bad!r}"):
                     _safe_ckpt_path(bad)
 
     def test_03_no_hardcoded_delroy_paths_and_conditional_proxy(self) -> None:
@@ -127,8 +145,8 @@ def _safe_ckpt_path(checkpoint_name: str) -> Path:
             txt = sp.read_text(encoding="utf-8")
             self.assertIn("nc -z 127.0.0.1 7890", txt)
 
-    def test_04_gacha_seed_parsing_and_workflow_mutation(self) -> None:
-        """Verify multi-seed parsing and ComfyUI workflow mutation for batch gacha."""
+    def test_04_gacha_seed_parsing_workflow_mutation_and_stitching_integration(self) -> None:
+        """Verify multi-seed parsing, `_SegXX` prefix preservation, boolean safety, Web UI format check, and stitching."""
         seeds = gacha.parse_seed_list(None, seed_base=1000, gacha_runs=4, seed_step=10)
         self.assertEqual(seeds, [1000, 1010, 1020, 1030])
 
@@ -140,8 +158,15 @@ def _safe_ckpt_path(checkpoint_name: str) -> Path:
         with self.assertRaises(ValueError):
             gacha.parse_seed_list(None, seed_base=10, gacha_runs=0)
 
+        # Reject ComfyUI Web UI format JSON cleanly
+        webui_wf_path = REPO_ROOT / "workflows" / "04_douyin_beauty_dance" / "h3-motion-transfer-workflow.json"
+        if webui_wf_path.exists():
+            webui_wf = json.loads(webui_wf_path.read_text(encoding="utf-8"))
+            with self.assertRaises(ValueError):
+                gacha.mutate_workflow_for_gacha_take(webui_wf, take_idx=1, take_seed=12345)
+
         sample_wf = {
-            "25": {"class_type": "RandomNoise", "inputs": {"noise_seed": 111}},
+            "25": {"class_type": "RandomNoise", "inputs": {"noise_seed": 111, "seed": True}},
             "35": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "Dance_Seg01"}},
             "45": {"class_type": "RandomNoise", "inputs": {"noise_seed": 112}},
             "55": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "Dance_Seg02"}},
@@ -149,14 +174,48 @@ def _safe_ckpt_path(checkpoint_name: str) -> Path:
         }
         mut_wf, prefixes = gacha.mutate_workflow_for_gacha_take(sample_wf, take_idx=2, take_seed=8888)
         self.assertEqual(mut_wf["25"]["inputs"]["noise_seed"], 8888)
+        # Ensure boolean input was NOT corrupted into an integer seed
+        self.assertIs(mut_wf["25"]["inputs"]["seed"], True)
         self.assertEqual(mut_wf["45"]["inputs"]["noise_seed"], 8889)
-        self.assertIn("Dance_Seg01_GachaT02_S8888", prefixes)
+        # Ensure _GachaT02_S8888 is inserted BEFORE _Seg01 / _Seg02 so stitch_available_segments finds them
+        self.assertIn("Dance_GachaT02_S8888_Seg01", prefixes)
+        self.assertIn("Dance_GachaT02_S8888_Seg02", prefixes)
         self.assertEqual(
             mut_wf["901"]["inputs"]["checkpoint_name"],
-            "Dance_Seg01_av_latent_GachaT02_S8888.pt",
+            "Dance_GachaT02_S8888_Seg01_av_latent.pt",
         )
         # Ensure original workflow was not mutated in-place
         self.assertEqual(sample_wf["25"]["inputs"]["noise_seed"], 111)
+
+        # End-to-end integration test with `run_dance.py` and `run_drama.py` stitch_available_segments
+        if shutil.which("ffmpeg"):
+            run_dance_mod = _load_module_from_path(
+                "run_dance_mod",
+                REPO_ROOT / "workflows" / "04_douyin_beauty_dance" / "run_dance.py",
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_out = Path(tmpdir)
+                for seg_prefix in prefixes:
+                    seg_mp4 = tmp_out / f"{seg_prefix}_00001_.mp4"
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-f", "lavfi", "-i", "color=c=blue:s=160x284:r=12:d=1",
+                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                            "-t", "1",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-shortest",
+                            str(seg_mp4),
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                take_prefix = "Dance_GachaT02_S8888"
+                master_mp4 = run_dance_mod.stitch_available_segments(take_prefix, tmp_out, segment_count=2)
+                self.assertIsNotNone(master_mp4, "stitch_available_segments failed to find gacha segment MP4s")
+                self.assertTrue(master_mp4.exists())
+                self.assertEqual(master_mp4.name, "Dance_GachaT02_S8888_Master.mp4")
 
     def test_05_gcs_uri_validation(self) -> None:
         """Verify GCS URI validation accepts valid buckets and rejects injection/invalid URIs."""
@@ -232,6 +291,23 @@ def _safe_ckpt_path(checkpoint_name: str) -> Path:
                     sh_count += 1
         self.assertGreaterEqual(py_count, 20)
         self.assertGreaterEqual(sh_count, 2)
+
+    def test_08_skill_mirror_parity(self) -> None:
+        """Verify `skills/colab-ultra-workstation/` matches the root `SKILL.md`, `scripts/`, and `references/`."""
+        skill_root = REPO_ROOT / "skills" / "colab-ultra-workstation"
+        for root, dirs, files in os.walk(skill_root):
+            if "__pycache__" in dirs:
+                dirs.remove("__pycache__")
+            for f in files:
+                sp = Path(root) / f
+                rel = sp.relative_to(skill_root)
+                rp = REPO_ROOT / rel
+                self.assertTrue(rp.exists(), f"Skill file {rel} has no counterpart at {rp}")
+                self.assertEqual(
+                    sp.read_bytes(),
+                    rp.read_bytes(),
+                    f"Skill mirror {sp} is out of sync with root {rp}",
+                )
 
 
 if __name__ == "__main__":

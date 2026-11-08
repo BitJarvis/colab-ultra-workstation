@@ -323,8 +323,11 @@ LATENT_DIR = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/output/latents"
 def _safe_ckpt_path(checkpoint_name: str) -> Path:
     base = LATENT_DIR.resolve()
     base.mkdir(parents=True, exist_ok=True)
-    raw_name = Path(str(checkpoint_name).strip()).name
-    if not raw_name or raw_name in (".", ".."):
+    normalized = str(checkpoint_name or "").strip().replace(chr(92), "/")
+    if not normalized or normalized.endswith("/"):
+        raise ValueError(f"[H3LatentCheckpoint] Invalid checkpoint_name: {checkpoint_name!r}")
+    raw_name = Path(normalized).name
+    if not raw_name or raw_name in (".", "..") or "/" in raw_name or chr(92) in raw_name:
         raise ValueError(f"[H3LatentCheckpoint] Invalid checkpoint_name: {checkpoint_name!r}")
     fname = raw_name if raw_name.endswith(".pt") else f"{raw_name}.pt"
     candidate = (base / fname).resolve()

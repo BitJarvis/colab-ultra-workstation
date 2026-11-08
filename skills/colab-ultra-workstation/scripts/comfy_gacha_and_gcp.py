@@ -39,11 +39,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_API_URL = os.environ.get("COMFY_API_URL", "http://127.0.0.1:8188")
-SEED_INPUT_KEYS = ("noise_seed", "seed")
+SEED_INPUT_KEYS = ("noise_seed", "seed", "rand_seed", "s_seed")
 OUTPUT_PREFIX_KEYS = ("filename_prefix",)
 LATENT_CKPT_KEYS = ("checkpoint_name",)
+SEG_SUFFIX_RE = re.compile(r"^(.*?)(_Seg\d+.*)$")
 
 GCS_URI_RE = re.compile(r"^gs://[a-z0-9][a-z0-9._-]{1,61}[a-z0-9](/[^\s]*)?$")
+
+
+def _format_gacha_prefix(orig_prefix: str, tag: str, base_prefix: Optional[str] = None) -> str:
+    """Format an output `filename_prefix` or `checkpoint_name` stem with `tag` while preserving `_SegXX` suffix ordering.
+
+    Example:
+      - `DouyinDance_15s_V1_Seg01` + `GachaT01_S1001` -> `DouyinDance_15s_V1_GachaT01_S1001_Seg01`
+        (so `stitch_available_segments(f"{prefix}_{tag}", ...)` finds `{prefix}_{tag}_Seg01*.mp4`!)
+      - `ComfyUI` + `GachaT01_S1001` (with `base_prefix="WanGacha"`) -> `WanGacha_ComfyUI_GachaT01_S1001`
+    """
+    pref = orig_prefix
+    if base_prefix and not pref.startswith(base_prefix):
+        pref = f"{base_prefix}_{pref}"
+    m = SEG_SUFFIX_RE.match(pref)
+    if m:
+        return f"{m.group(1)}_{tag}{m.group(2)}"
+    return f"{pref}_{tag}"
 
 
 def validate_gcs_uri(uri: str) -> str:
@@ -84,6 +102,20 @@ def parse_seed_list(
     return [int(seed_base + i * seed_step) for i in range(gacha_runs)]
 
 
+def ensure_api_workflow_format(workflow: Dict[str, Any], source_hint: str = "workflow.json") -> None:
+    """Ensure `workflow` is a ComfyUI API prompt dict (`{node_id: {class_type, inputs}}`) rather than UI-export format."""
+    if not isinstance(workflow, dict) or not workflow:
+        raise ValueError(f"Invalid empty or non-dict ComfyUI workflow in {source_hint}.")
+    has_api_nodes = any(isinstance(v, dict) and "class_type" in v for v in workflow.values())
+    if not has_api_nodes:
+        if "nodes" in workflow and "links" in workflow:
+            raise ValueError(
+                f"Workflow '{source_hint}' is in ComfyUI Web UI format (contains 'nodes'/'links' arrays) rather than API format. "
+                "Please export using 'Save (API Format)' in ComfyUI Dev Mode or use one of the API workflow JSONs."
+            )
+        raise ValueError(f"Workflow '{source_hint}' does not contain any valid ComfyUI API nodes ('class_type').")
+
+
 def mutate_workflow_for_gacha_take(
     workflow: Dict[str, Any],
     take_idx: int,
@@ -98,6 +130,7 @@ def mutate_workflow_for_gacha_take(
     all seed nodes in the workflow are deterministically offset by `(take_seed + node_offset)`.
     Returns `(mutated_wf, expected_filename_prefixes)`.
     """
+    ensure_api_workflow_format(workflow)
     wf = copy.deepcopy(workflow)
     tag = f"GachaT{take_idx:02d}_S{take_seed}"
     expected_prefixes: List[str] = []
@@ -118,7 +151,7 @@ def mutate_workflow_for_gacha_take(
             continue
 
         for sk in SEED_INPUT_KEYS:
-            if sk in inputs and isinstance(inputs[sk], (int, float)):
+            if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
                 # Keep multi-segment relative offsets distinct while anchoring on take_seed
                 inputs[sk] = int(take_seed) + seed_nodes_updated
                 seed_nodes_updated += 1
@@ -129,12 +162,13 @@ def mutate_workflow_for_gacha_take(
             node = wf[nid]
             inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
             for sk in SEED_INPUT_KEYS:
-                if sk in inputs and isinstance(inputs[sk], (int, float)):
+                if sk in inputs and isinstance(inputs[sk], (int, float)) and not isinstance(inputs[sk], bool):
                     inputs[sk] = int(take_seed) + seed_nodes_updated
                     seed_nodes_updated += 1
 
     # 2. Rewrite filename_prefix on SaveVideo / VHS_VideoCombine / SaveImage nodes and H3SaveAVLatent checkpoints
-    for nid, node in wf.items():
+    for nid in sorted(wf.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999):
+        node = wf[nid]
         if not isinstance(node, dict):
             continue
         inputs = node.get("inputs", {})
@@ -143,11 +177,7 @@ def mutate_workflow_for_gacha_take(
 
         for pk in OUTPUT_PREFIX_KEYS:
             if pk in inputs and isinstance(inputs[pk], str):
-                orig_prefix = inputs[pk]
-                if base_prefix and not orig_prefix.startswith(base_prefix):
-                    new_prefix = f"{base_prefix}_{orig_prefix}_{tag}"
-                else:
-                    new_prefix = f"{orig_prefix}_{tag}"
+                new_prefix = _format_gacha_prefix(inputs[pk], tag, base_prefix=base_prefix)
                 inputs[pk] = new_prefix
                 expected_prefixes.append(new_prefix)
 
@@ -156,9 +186,25 @@ def mutate_workflow_for_gacha_take(
                 if ck in inputs and isinstance(inputs[ck], str):
                     stem = Path(inputs[ck]).stem
                     suffix = Path(inputs[ck]).suffix or ".pt"
-                    inputs[ck] = f"{stem}_{tag}{suffix}"
+                    if stem.endswith("_av_latent"):
+                        base_stem = stem[: -len("_av_latent")]
+                        new_stem = f"{_format_gacha_prefix(base_stem, tag, base_prefix=base_prefix)}_av_latent"
+                    else:
+                        new_stem = _format_gacha_prefix(stem, tag, base_prefix=base_prefix)
+                    inputs[ck] = f"{new_stem}{suffix}"
 
     return wf, expected_prefixes
+
+
+def _ffmpeg_has_drawtext() -> bool:
+    """Return True if the installed `ffmpeg` binary supports the `drawtext` filter."""
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        out = subprocess.check_output(["ffmpeg", "-hide_banner", "-filters"], stderr=subprocess.DEVNULL, text=True)
+        return " drawtext " in out
+    except Exception:
+        return False
 
 
 def build_ffmpeg_grid_command(
@@ -167,6 +213,7 @@ def build_ffmpeg_grid_command(
     seeds: Optional[List[int]] = None,
     tile_w: int = 540,
     tile_h: int = 960,
+    enable_watermark: Optional[bool] = None,
 ) -> List[str]:
     """Build an FFmpeg command that stitches 2..9 gacha take videos into a labeled comparison grid (`xstack`)."""
     n = len(video_paths)
@@ -175,6 +222,7 @@ def build_ffmpeg_grid_command(
 
     cols = 2 if n <= 4 else 3
     rows = int(math.ceil(n / float(cols)))
+    use_drawtext = _ffmpeg_has_drawtext() if enable_watermark is None else bool(enable_watermark)
 
     cmd: List[str] = ["ffmpeg", "-y"]
     for vp in video_paths:
@@ -186,10 +234,18 @@ def build_ffmpeg_grid_command(
     for idx in range(n):
         r = idx // cols
         c = idx % cols
-        # Scale & pad each input to identical tile dimensions
+        seed_lbl = f"seed={seeds[idx]}" if (seeds and idx < len(seeds)) else f"take={idx + 1}"
+        drawtext_chain = ""
+        if use_drawtext:
+            safe_txt = f"Take #{idx + 1}  {seed_lbl}".replace(":", "\\:").replace("'", "")
+            drawtext_chain = (
+                f",drawtext=text='{safe_txt}':x=16:y=16:fontsize=24:fontcolor=white:"
+                f"box=1:boxcolor=black@0.55:boxborderw=6"
+            )
+        # Scale & pad each input to identical tile dimensions (+ optional watermark)
         filter_parts.append(
             f"[{idx}:v]scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
-            f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v{idx}]"
+            f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1{drawtext_chain}[v{idx}]"
         )
         x_expr = "0" if c == 0 else "+".join([f"w{k}" for k in range(c)])
         y_expr = "0" if r == 0 else "+".join([f"h{k * cols}" for k in range(r)])

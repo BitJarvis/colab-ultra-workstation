@@ -198,7 +198,7 @@ def apply_config_and_cli_overrides(wf: dict, args) -> str:
         save_nid = meta["save"]
 
         if save_nid in wf:
-            wf[save_nid]["inputs"]["filename_prefix"] = f"{prefix}_Seg0{seg_id}"
+            wf[save_nid]["inputs"]["filename_prefix"] = f"{prefix}_Seg{seg_id:02d}"
 
         # Seed
         if "seed" in scfg and noise_nid in wf:
@@ -359,11 +359,11 @@ def stitch_available_segments(prefix: str, out_mp4_name: str, expected_segs: Lis
     out_dirs = [LOCAL_COMFY / "output", DRIVE_COMFY / "output"]
     segs = []
     for idx in expected_segs:
-        seg_prefix = f"{prefix}_Seg0{idx}"
+        seg_prefix = f"{prefix}_Seg{idx:02d}"
         candidates = []
         for od in out_dirs:
             if od.exists():
-                candidates.extend(od.glob(f"{seg_prefix}*.mp4"))
+                candidates.extend([p for p in od.glob(f"{seg_prefix}*.mp4") if "_hist_" not in p.name])
         candidates.sort(key=lambda p: p.stat().st_mtime)
         if not candidates:
             print(f"ℹ️ 暂未找到分镜 {seg_prefix}*.mp4，跳过全片母带拼接。", flush=True)
@@ -432,7 +432,7 @@ def inject_latent_checkpoints_and_slice(
                     "class_type": "H3SaveAVLatent",
                     "inputs": {
                         "latent": [lat_nid, 0],
-                        "checkpoint_name": f"{prefix}_Seg0{s}_av_latent.pt",
+                        "checkpoint_name": f"{prefix}_Seg{s:02d}_av_latent.pt",
                     },
                 }
     else:
@@ -441,7 +441,7 @@ def inject_latent_checkpoints_and_slice(
     if start_seg > 1:
         needs_prev_latent = SEG_META[start_seg]["ctx"] is not None
         prev_s = start_seg - 1
-        ckpt_name = f"{prefix}_Seg0{prev_s}_av_latent.pt"
+        ckpt_name = f"{prefix}_Seg{prev_s:02d}_av_latent.pt"
         ckpt_path = latent_dir / ckpt_name
         if not needs_prev_latent:
             print(f"⚡ 第 {start_seg} 段为独立切镜模式 (无上游潜空间依赖)，直接剥离前 {prev_s} 段独立极速渲染！", flush=True)
@@ -497,6 +497,12 @@ def main() -> None:
     parser.add_argument("--only-seg", type=int, choices=[1, 2, 3, 4], default=None, help="Hot-swap only segment N (~3 min)")
     parser.add_argument("--start-seg", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument("--end-seg", type=int, choices=[1, 2, 3, 4], default=4)
+    parser.add_argument("--gacha-runs", type=int, default=1, help="Multi-seed batch gacha count (e.g. 4 for 2x2 comparison grid)")
+    parser.add_argument("--seed-base", type=int, default=2026110801, help="Starting seed for batch gacha")
+    parser.add_argument("--seeds", default=None, help="Explicit comma-separated seed list for batch gacha, e.g. '101,202,303,404'")
+    parser.add_argument("--gcs-bucket", default=None, help="Optional GCS URI (gs://bucket/prefix) to auto-sync generated MP4s & grids")
+    parser.add_argument("--gcp-project", default=None, help="Optional GCP project ID for GCS sync")
+    parser.add_argument("--gcp-sa-json", default=None, help="Optional GCP Service Account JSON path for GCS sync")
     args = parser.parse_args()
 
     start_s = args.only_seg if args.only_seg else args.start_seg
@@ -522,8 +528,60 @@ def main() -> None:
     # Stage only the active LoadImage / LoadAudio files required by the sliced graph
     sync_inputs_to_local_ssd(wf)
 
-    submit_and_wait(wf, f"MiniMax-H3 Seg[{start_s}..{end_s}] ({prefix})")
-    stitch_available_segments(prefix, out_mp4)
+    is_gacha = (args.gacha_runs and args.gacha_runs > 1) or bool(args.seeds)
+    synced_outputs: List[Path] = []
+    if is_gacha:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.path.insert(0, "/tmp")
+        from comfy_gacha_and_gcp import (
+            mutate_workflow_for_gacha_take,
+            parse_seed_list,
+            render_gacha_comparison_grid,
+        )
+
+        seeds = parse_seed_list(args.seeds, seed_base=args.seed_base, gacha_runs=args.gacha_runs)
+        print(f"🎰 启动双人对手戏多卡连抽模式 (共 {len(seeds)} 组 Seed: {seeds})...", flush=True)
+        for idx, seed_val in enumerate(seeds, start=1):
+            take_prefix = f"{prefix}_GachaT{idx:02d}_S{seed_val}"
+            take_wf, _ = mutate_workflow_for_gacha_take(
+                wf,
+                take_idx=idx,
+                take_seed=seed_val,
+                target_seg_id=args.only_seg,
+            )
+            submit_and_wait(take_wf, f"Drama Gacha #{idx}/{len(seeds)} (seed={seed_val})")
+            take_mp4_name = f"{take_prefix}_Master.mp4"
+            stitched = stitch_available_segments(
+                take_prefix,
+                take_mp4_name,
+                expected_segs=[args.only_seg] if args.only_seg else [1, 2, 3, 4],
+            )
+            if stitched and stitched.exists():
+                synced_outputs.append(stitched)
+
+        if len(synced_outputs) >= 2:
+            grid_p = DRIVE_COMFY / "output" / f"{prefix}_Gacha_{len(synced_outputs)}way_Grid.mp4"
+            render_gacha_comparison_grid(synced_outputs, grid_p, seeds=seeds, tile_w=960, tile_h=540)
+            if grid_p.exists():
+                synced_outputs.append(grid_p)
+    else:
+        submit_and_wait(wf, f"MiniMax-H3 Seg[{start_s}..{end_s}] ({prefix})")
+        stitched = stitch_available_segments(prefix, out_mp4)
+        if stitched and stitched.exists():
+            synced_outputs.append(stitched)
+
+    if args.gcs_bucket and synced_outputs:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.path.insert(0, "/tmp")
+        from comfy_gacha_and_gcp import gcs_sync_directory_or_files
+
+        gcs_sync_directory_or_files(
+            synced_outputs,
+            gcs_uri=args.gcs_bucket,
+            direction="push",
+            service_account_json=args.gcp_sa_json,
+            project_id=args.gcp_project,
+        )
 
     print(f"🎉 ALL_V25_DONE (总用时 {time.time() - t_start:.1f}s)", flush=True)
 
