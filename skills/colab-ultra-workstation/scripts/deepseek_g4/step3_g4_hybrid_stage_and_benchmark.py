@@ -39,6 +39,7 @@ VARIANTS = {
             "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf",  # 16.42 GB (Total backbone: 165.30 GB / 153.96 GiB)
         ],
         "shard_engram": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf",  # 110.60 GB logical (sparse header)
+        "mmproj_file": "mmproj-BF16.gguf",  # 972.2 MB (0.91 GiB) native BF16 Vision Projector
         "model_name": "deepseek-v4.1-flash-1017-uncensored-gsq-rco-iq2_xxs",
         "display_name": "DeepSeek V4.1 Flash · Unsloth Dynamic V3.1 UD-IQ2_XXS (G4 96GB Blackwell)",
         "is_gsq_4shard": False,
@@ -55,10 +56,32 @@ VARIANTS = {
             "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf",  # 20.87 GB (Total backbone: 138.59 GB / 129.07 GiB)
         ],
         "shard_engram": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",  # 110.60 GB logical (sparse header)
+        "mmproj_file": "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf",  # 972.2 MB (0.91 GiB) native BF16 Vision Projector
         "model_name": "deepseek-v4.1-flash-1017-uncensored-gsq-rco-iq2_xxs",
         "display_name": "DeepSeek V4.1 Flash Uncensored · Abiray GSQ-RCO IQ2_XXS (G4 96GB Blackwell)",
         "is_gsq_4shard": True,
         "arena_gib": 44,
+    },
+    "ista-coder-iq2xxs": {
+        "repo": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF",
+        "subdir": "ista_coder",
+        "hf_prefix": "IQ2_XXS/",
+        "shards_nvme": [
+            "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00001-of-00006.gguf",  # 0.006 GB (5.78 MB metadata)
+            "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00002-of-00006.gguf",  # 19.78 GB
+            "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00003-of-00006.gguf",  # 19.94 GB
+            "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00004-of-00006.gguf",  # 19.68 GB
+            "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00005-of-00006.gguf",  # 12.72 GB (Total backbone: 72.12 GB / 67.17 GiB -> 100% in 96GB VRAM!)
+        ],
+        "shard_engram": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-00006-of-00006.gguf",
+        "hf_engram_path": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",  # 110.60 GB / 103.00 GiB full IQ4_NL Engram -> 100% in 188GB DDR5 Page Cache!
+        "mmproj_file": "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf",  # 972.2 MB (0.91 GiB) native BF16 Vision Projector
+        "full_engram": True,
+        "omit_rank": True,
+        "model_name": "deepseek-v4.1-flash-1017-uncensored-gsq-rco-iq2_xxs",
+        "display_name": "DeepSeek V4.1 Flash · ISTA-DASLab GSQ-RCO-Coder IQ2_XXS + Full 110.6GB Engram (G4 96GB Blackwell)",
+        "is_gsq_4shard": False,
+        "arena_gib": 0,
     },
 }
 
@@ -70,8 +93,24 @@ def ensure_precompiled_engines():
     """
     ds41_bin = "/content/engines/bin/ds41_generate"
     tar_path = os.path.join(DRIVE_V41_DIR, "bin/g4_sm120a_engines.tar.gz")
+    local_tar = "/tmp/g4_sm120a_engines.tar.gz"
     if os.path.exists(ds41_bin):
         return
+    if not os.path.exists(tar_path):
+        try:
+            tok = _get_colab_drive_token()
+            fid, fsz = _lookup_drive_file("g4_sm120a_engines.tar.gz", tok)
+            if fid and fsz > 0:
+                print(f"=== [0/3] Pulling g4_sm120a_engines.tar.gz ({fsz/1e6:.1f} MB) via Drive v3 API ===", flush=True)
+                req = urllib.request.Request(
+                    f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media",
+                    headers={"Authorization": f"Bearer {tok}"},
+                )
+                with urllib.request.urlopen(req, timeout=60) as r, open(local_tar, "wb") as f:
+                    shutil.copyfileobj(r, f)
+                tar_path = local_tar
+        except Exception as e:
+            print(f"  [Drive v3 engine pull note]: {e}", flush=True)
     if os.path.exists(tar_path):
         print(f"=== [0/3] Unpacking Precompiled Blackwell sm_120a Engines from {tar_path} (~2s) ===", flush=True)
         os.makedirs("/content/engines", exist_ok=True)
@@ -108,15 +147,62 @@ def _lookup_drive_file(shard_name, token):
 
 
 def _lookup_hf_file(repo, hf_prefix, shard_name):
-    """Return (resolved_cdn_url, size_bytes) from Hugging Face Hub."""
+    """Return (resolved_cdn_url, size_bytes) from Hugging Face Hub (uses HF_TOKEN if present for higher rate/speed limits)."""
     url = f"https://huggingface.co/{repo}/resolve/main/{hf_prefix}{shard_name}"
-    req = urllib.request.Request(url, method="HEAD")
+    headers = {}
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not hf_tok:
+        for p in ("/content/drive/MyDrive/colab-llm/hf_token.txt", "/root/.cache/huggingface/token"):
+            if os.path.isfile(p):
+                hf_tok = open(p).read().strip()
+                if hf_tok:
+                    break
+    if hf_tok:
+        headers["Authorization"] = f"Bearer {hf_tok}"
+    req = urllib.request.Request(url, method="HEAD", headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
         cl = resp.headers.get("X-Linked-Size") or resp.headers.get("Content-Length") or "0"
         return resp.url, int(cl)
 
 
-def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
+def ensure_mainline_llamacpp_b12128():
+    """
+    Ensure mainline llama.cpp (b12128+, CUDA 13.4 x64 with PR #31086 DSV4.1 + deepseek4v vision)
+    is unpacked at /content/engines/llama_b12128/llama-server and cached on Google Drive.
+    """
+    target_dir = "/content/engines/llama_b12128"
+    for cand in (
+        os.path.join(target_dir, "llama-server"),
+        os.path.join(target_dir, "build/bin/llama-server"),
+        os.path.join(target_dir, "bin/llama-server"),
+    ):
+        if os.path.exists(cand):
+            return cand
+    os.makedirs(target_dir, exist_ok=True)
+    drive_tar = os.path.join(DRIVE_V41_DIR, "bin/llama-b12128-bin-ubuntu-cuda-13.4-x64.tar.gz")
+    local_tar = "/tmp/llama-b12128-bin-ubuntu-cuda-13.4-x64.tar.gz"
+    if os.path.exists(drive_tar) and os.path.getsize(drive_tar) > 50_000_000:
+        shutil.copyfile(drive_tar, local_tar)
+    else:
+        url = "https://github.com/ggml-org/llama.cpp/releases/download/b12128/llama-b12128-bin-ubuntu-cuda-13.4-x64.tar.gz"
+        print(f"=== Downloading mainline llama.cpp b12128 CUDA 13.4 binary (~170 MB) ===", flush=True)
+        with urllib.request.urlopen(url, timeout=120) as r, open(local_tar, "wb") as f:
+            shutil.copyfileobj(r, f)
+        if os.path.exists(os.path.dirname(drive_tar)):
+            try:
+                shutil.copyfile(local_tar, drive_tar)
+            except Exception:
+                pass
+    subprocess.run(["tar", "-xzf", local_tar, "-C", target_dir], check=True)
+    for root, _, files in os.walk(target_dir):
+        if "llama-server" in files:
+            srv = os.path.join(root, "llama-server")
+            os.chmod(srv, 0o755)
+            return srv
+    return "/content/engines/bin/llama-server"
+
+
+def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs", mode="delta", sparse_engram=False):
     """
     Stage all backbone shards (165.30 GB for Unsloth UD-IQ2_XXS or 138.59 GB for Abiray GSQ-RCO IQ2_XXS)
     directly onto G4's local PCIe Gen5 NVMe (/content/fast_deepseek) via 64-stream Google Drive v3 API Range
@@ -146,8 +232,8 @@ def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
         hf_url = None
         if not file_id:
             hf_url, total_sz = _lookup_hf_file(v["repo"], v["hf_prefix"], shard)
-        if os.path.exists(dst) and os.path.getsize(dst) == total_sz and total_sz > 0:
-            print(f"  [NVMe READY] {shard} ({total_sz/1e9:.2f} GB)", flush=True)
+        if os.path.exists(dst) and total_sz > 0 and (os.path.getsize(dst) == total_sz or abs(os.path.getsize(dst) - total_sz) <= 512):
+            print(f"  [NVMe READY] {shard} ({os.path.getsize(dst)/1e9:.2f} GB)", flush=True)
             return
         if not file_id and not hf_url:
             sys.exit(f"[ERROR] {shard} not found in Google Drive v3 API or Hugging Face!")
@@ -210,7 +296,58 @@ def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
     print(f"=== [2/3] Creating Local NVMe Engram GGUF Mapping ({v['shard_engram']}) ===")
     engram_src = os.path.join(drive_v_dir, v["shard_engram"])
     engram_dst = os.path.join(fast_v_dir, "engram_local_nvme.gguf" if v["is_gsq_4shard"] else v["shard_engram"])
-    if os.path.exists(engram_src):
+    if v.get("full_engram") and not sparse_engram:
+        hf_eng_rel = v.get("hf_engram_path", v["shard_engram"])
+        file_id, engram_size = _lookup_drive_file(os.path.basename(hf_eng_rel), token)
+        hf_engram_url = None
+        if not file_id:
+            hf_engram_url, engram_size = _lookup_hf_file(v["repo"], "", hf_eng_rel)
+        if not os.path.exists(engram_dst) or os.path.islink(engram_dst) or os.path.getsize(engram_dst) != engram_size:
+            t_eng0 = time.time()
+            src_lbl = "DRIVE-v3" if file_id else "HF-HUB"
+            print(f"  [FULL ENGRAM {src_lbl} -> NVMe + DDR5 CACHE] {v['shard_engram']} ({engram_size/1e9:.2f} GB)...", flush=True)
+            tmp_eng = engram_dst + ".part"
+            fd = os.open(tmp_eng, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            os.ftruncate(fd, engram_size)
+            eng_ranges = []
+            off = 0
+            while off < engram_size:
+                end = min(off + chunk_bytes - 1, engram_size - 1)
+                eng_ranges.append((off, end))
+                off = end + 1
+
+            def _fetch_eng_chunk(rng):
+                s_off, e_off = rng
+                for attempt in range(4):
+                    try:
+                        if file_id:
+                            cur_tok = token if attempt == 0 else _get_colab_drive_token()
+                            req = urllib.request.Request(
+                                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                                headers={"Authorization": f"Bearer {cur_tok}", "Range": f"bytes={s_off}-{e_off}"},
+                            )
+                        else:
+                            req = urllib.request.Request(hf_engram_url, headers={"Range": f"bytes={s_off}-{e_off}"})
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            buf = resp.read()
+                        os.pwrite(fd, buf, s_off)
+                        return len(buf)
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        time.sleep(0.5 * (attempt + 1))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=24) as eng_ex:
+                list(eng_ex.map(_fetch_eng_chunk, eng_ranges))
+            os.close(fd)
+            if os.path.lexists(engram_dst):
+                os.remove(engram_dst)
+            os.rename(tmp_eng, engram_dst)
+            dt_eng = max(0.1, time.time() - t_eng0)
+            print(f"  [DONE FULL ENGRAM NVMe + DDR5 CACHE] {engram_dst} ({engram_size/1e9:.2f} GB in {dt_eng:.1f}s = {engram_size/1e6/dt_eng:.0f} MB/s)", flush=True)
+        else:
+            print(f"  [FULL ENGRAM NVMe READY] {engram_dst} ({engram_size/1e9:.2f} GB)", flush=True)
+    elif os.path.exists(engram_src):
         engram_size = os.path.getsize(engram_src)
         if not os.path.exists(engram_dst) or os.path.islink(engram_dst) or os.path.getsize(engram_dst) != engram_size:
             if os.path.lexists(engram_dst):
@@ -220,8 +357,13 @@ def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
             with open(engram_dst, "wb") as fdst:
                 fdst.write(hdr)
                 fdst.truncate(engram_size)
+        print(f"  [NVMe ENGRAM OK] {engram_dst} ({engram_size/1e9:.2f} GB sparse NVMe backing)")
     else:
-        hf_engram_url, engram_size = _lookup_hf_file(v["repo"], v["hf_prefix"], v["shard_engram"])
+        hf_eng_rel = v.get("hf_engram_path")
+        if hf_eng_rel:
+            hf_engram_url, engram_size = _lookup_hf_file(v["repo"], "", hf_eng_rel)
+        else:
+            hf_engram_url, engram_size = _lookup_hf_file(v["repo"], v["hf_prefix"], v["shard_engram"])
         if not os.path.exists(engram_dst) or os.path.islink(engram_dst) or os.path.getsize(engram_dst) != engram_size:
             if os.path.lexists(engram_dst):
                 os.remove(engram_dst)
@@ -231,7 +373,7 @@ def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
             with open(engram_dst, "wb") as fdst:
                 fdst.write(hdr)
                 fdst.truncate(engram_size)
-    print(f"  [NVMe ENGRAM OK] {engram_dst} ({engram_size/1e9:.2f} GB sparse NVMe backing)")
+        print(f"  [NVMe ENGRAM OK] {engram_dst} ({engram_size/1e9:.2f} GB sparse NVMe backing)")
 
     # Also copy DSpark sidecar to NVMe if available on Drive
     dspark_src = os.path.join(DRIVE_V41_DIR, "V41-1017-MTP-iq2xxs.gguf")
@@ -240,8 +382,126 @@ def stage_hybrid_layout(variant_key="unsloth-ud-iq2xxs"):
         print("  [COPYING DSpark Drafter -> NVMe] V41-1017-MTP-iq2xxs.gguf (4.22 GB)...")
         shutil.copyfile(dspark_src, dspark_dst)
 
+    # Stage 972.2 MB BF16 Multimodal Vision Projector (mmproj) onto NVMe (Drive v3 API or HF CDN)
+    mmproj_name = v.get("mmproj_file", "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf")
+    mmproj_dst = os.path.join(FAST_DIR, "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf")
+    if not os.path.exists(mmproj_dst) or os.path.getsize(mmproj_dst) < 900_000_000:
+        mm_id, mm_sz = _lookup_drive_file(mmproj_name, token)
+        if not mm_id and mmproj_name != "mmproj-BF16.gguf":
+            mm_id, mm_sz = _lookup_drive_file("mmproj-BF16.gguf", token)
+        mm_url = None
+        if not mm_id:
+            try:
+                mm_url, mm_sz = _lookup_hf_file(v["repo"], "", mmproj_name)
+            except Exception as e:
+                print(f"  [MMPROJ NOTE] Could not resolve {mmproj_name}: {e}", flush=True)
+                mm_sz = 0
+        if mm_sz > 0:
+            t_mm0 = time.time()
+            src_mm = "DRIVE-v3" if mm_id else "HF-HUB"
+            print(f"  [VISION MMPROJ {src_mm} -> NVMe] {mmproj_name} ({mm_sz/1e6:.1f} MB)...", flush=True)
+            tmp_mm = mmproj_dst + ".part"
+            fd_mm = os.open(tmp_mm, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            os.ftruncate(fd_mm, mm_sz)
+            mm_ranges = []
+            off = 0
+            while off < mm_sz:
+                end = min(off + chunk_bytes - 1, mm_sz - 1)
+                mm_ranges.append((off, end))
+                off = end + 1
+
+            def _fetch_mm_chunk(rng):
+                s_off, e_off = rng
+                for attempt in range(4):
+                    try:
+                        if mm_id:
+                            cur_tok = token if attempt == 0 else _get_colab_drive_token()
+                            req = urllib.request.Request(
+                                f"https://www.googleapis.com/drive/v3/files/{mm_id}?alt=media",
+                                headers={"Authorization": f"Bearer {cur_tok}", "Range": f"bytes={s_off}-{e_off}"},
+                            )
+                        else:
+                            req = urllib.request.Request(mm_url, headers={"Range": f"bytes={s_off}-{e_off}"})
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            buf = resp.read()
+                        os.pwrite(fd_mm, buf, s_off)
+                        return len(buf)
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        time.sleep(0.5 * (attempt + 1))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as mm_ex:
+                list(mm_ex.map(_fetch_mm_chunk, mm_ranges))
+            os.close(fd_mm)
+            os.rename(tmp_mm, mmproj_dst)
+            dt_mm = max(0.1, time.time() - t_mm0)
+            print(f"  [VISION MMPROJ READY] {mmproj_dst} ({mm_sz/1e6:.1f} MB in {dt_mm:.1f}s = {mm_sz/1e6/dt_mm:.0f} MB/s)", flush=True)
+    else:
+        print(f"  [VISION MMPROJ READY] {mmproj_dst} ({os.path.getsize(mmproj_dst)/1e6:.1f} MB)", flush=True)
+    v["mmproj_local_path"] = mmproj_dst if os.path.exists(mmproj_dst) else None
+
     first_shard = os.path.join(fast_v_dir, v["shards_nvme"][0])
+    if v.get("full_engram") and os.path.exists(first_shard) and mode == "delta":
+        patch_coder_shard1_gguf(first_shard)
     return first_shard, engram_dst, v
+
+
+def patch_coder_shard1_gguf(path):
+    """
+    ISTA-DASLab's GSQ-RCO-Coder 00001-of-00006.gguf (n_tensors=0 metadata-only shard) omits
+    deepseek41.engram.compressed_vocab_size (99092), which Delta (ds41_generate) requires in
+    ds41_read_geometry_llamacpp(). Since n_tensors == 0, we can safely append the missing KV entry.
+    """
+    import struct
+
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    magic, version, n_tensors, n_kv = struct.unpack_from("<4sIQQ", data, 0)
+    if magic != b"GGUF" or n_tensors != 0 or b"deepseek41.engram.compressed_vocab_size" in data:
+        return
+    pos = 24
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+    def skip_str(p):
+        ln = struct.unpack_from("<Q", data, p)[0]
+        return p + 8 + ln
+
+    def skip_val(vtype, p):
+        if vtype in sizes:
+            return p + sizes[vtype]
+        elif vtype == 8:
+            return skip_str(p)
+        elif vtype == 9:
+            atype, alen = struct.unpack_from("<IQ", data, p)
+            p += 12
+            if atype in sizes:
+                return p + alen * sizes[atype]
+            for _ in range(alen):
+                p = skip_val(atype, p)
+            return p
+        raise ValueError(f"Unknown GGUF vtype {vtype}")
+
+    for _ in range(n_kv):
+        pos = skip_str(pos)
+        vtype = struct.unpack_from("<I", data, pos)[0]
+        pos += 4
+        pos = skip_val(vtype, pos)
+
+    extra_kvs = [
+        (b"deepseek41.engram.compressed_vocab_size", 4, 99092),
+        (b"deepseek41.engram.vocab_size", 4, 16000000),
+        (b"deepseek41.embedding_length_out", 4, 20480),
+    ]
+    out = bytearray(data[:pos])
+    for kbytes, vtype, uval in extra_kvs:
+        out += struct.pack("<Q", len(kbytes)) + kbytes + struct.pack("<II", vtype, uval)
+    while len(out) % 32 != 0:
+        out += b"\x00"
+    struct.pack_into("<Q", out, 16, n_kv + len(extra_kvs))
+    with open(path, "wb") as f:
+        f.write(out)
+    print(f"  [GGUF HEADER PATCHED] Added deepseek41.engram.compressed_vocab_size=99092 to {path} (n_kv {n_kv}->{n_kv+len(extra_kvs)})", flush=True)
 
 
 def ensure_llamacpp_6shard_layout(fast_v_dir, engram_dst):
@@ -336,8 +596,6 @@ def build_delta_g4_config(
         "2.2",
         "--prompt-batch",
         "4096",
-        "--rank",
-        os.path.join(delta_root, "data/ds41/rank-1017-share.bin"),
         "--pf-b",
         "0.7",
         "--pcie",
@@ -346,6 +604,8 @@ def build_delta_g4_config(
         "--enc-replay",
         "2560",
     ]
+    if not v.get("omit_rank"):
+        engine_args.extend(["--rank", os.path.join(delta_root, "data/ds41/rank-1017-share.bin")])
 
     env_vars = {
         "STRATA_NO_LARGEPAGES": "1",
@@ -365,6 +625,8 @@ def build_delta_g4_config(
         "STRATA_SERVE_REWIND_GAP": "16",
         "STRATA_SERVE_ROLLBACK": "8",
         "STRATA_ENGRAM_THREADS": "16",
+        "STRATA_ENGRAM_RAWDEV": "0",
+        "STRATA_ENGRAM_DIRECT": "0",
         "STRATA_ENGINE_STALL_S": "0",
     }
     if quality_mode == "turbo":
@@ -407,11 +669,20 @@ def build_delta_g4_config(
     return cfg_path
 
 
-def spawn_eager_vram_seed(port=8150, model_name="deepseek-v4.1-flash-1017-uncensored-gsq-rco-iq2_xxs"):
+def spawn_eager_vram_seed(
+    port=8150,
+    model_name="deepseek-v4.1-flash-1017-uncensored-gsq-rco-iq2_xxs",
+    v=None,
+    fast_v_dir=None,
+    engram_dst=None,
+):
     """
     Spawn a background child process that waits for serve_ds41.py to report READY,
     then immediately triggers a 1-token warmup request so the ~87.2 GiB GDDR7 VRAM expert seed
     happens right away from the warm 188GB DDR5 Page Cache (~20s) and stays locked via STRATA_SERVE_KEEP_CACHE=1.
+    For full_engram variants (e.g. ista-coder-iq2xxs where 100% of 72.1GB backbone fits in 96GB VRAM),
+    once the backbone is locked in GDDR7 VRAM, drop the 5 backbone shards from DDR5 Page Cache and
+    warm 100% of the 110.6GB Engram shard into DDR5 Page Cache!
     """
     pid = os.fork()
     if pid != 0:
@@ -430,7 +701,7 @@ def spawn_eager_vram_seed(port=8150, model_name="deepseek-v4.1-flash-1017-uncens
     else:
         os._exit(0)
 
-    print("\n[EAGER-VRAM-SEED] Server READY -> Triggering 1-token warmup to open segmented ~87.2 GiB GDDR7 VRAM cache...", flush=True)
+    print("\n[EAGER-VRAM-SEED] Server READY -> Triggering 1-token warmup to open segmented GDDR7 VRAM cache...", flush=True)
     t0 = time.time()
     payload = {
         "model": model_name,
@@ -447,10 +718,150 @@ def spawn_eager_vram_seed(port=8150, model_name="deepseek-v4.1-flash-1017-uncens
         )
         with urllib.request.urlopen(req, timeout=600) as resp:
             resp.read()
-        print(f"[EAGER-VRAM-SEED] ✅ ~87.2 GiB hot MoE experts locked in GDDR7 VRAM in {time.time()-t0:.1f}s! Subsequent requests = 0.00s wait!", flush=True)
+        print(f"[EAGER-VRAM-SEED] ✅ All MoE experts locked in GDDR7 VRAM in {time.time()-t0:.1f}s! Subsequent requests = 0.00s wait!", flush=True)
+        if v and v.get("full_engram") and fast_v_dir and engram_dst and os.path.exists(engram_dst):
+            for sh in v.get("shards_nvme", [])[1:]:
+                sp = os.path.join(fast_v_dir, sh)
+                if os.path.exists(sp):
+                    try:
+                        fd_b = os.open(sp, os.O_RDONLY)
+                        os.posix_fadvise(fd_b, 0, 0, os.POSIX_FADV_DONTNEED)
+                        os.close(fd_b)
+                    except Exception:
+                        pass
+            t_w0 = time.time()
+            esz = os.path.getsize(engram_dst)
+            print(f"[ENGRAM-RAM-LOCK] Warming 100% of {esz/1e9:.2f} GB Engram into 188GB DDR5 Page Cache...", flush=True)
+            fd_e = os.open(engram_dst, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd_e, 0, 0, os.POSIX_FADV_WILLNEED)
+            except Exception:
+                pass
+            step_sz = 32 * 1024 * 1024
+            offs = list(range(0, esz, step_sz))
+            def _warm_off(o):
+                os.pread(fd_e, min(step_sz, esz - o), o)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as wex:
+                list(wex.map(_warm_off, offs))
+            os.close(fd_e)
+            print(f"[ENGRAM-RAM-LOCK] ✅ 100% of {esz/1e9:.2f} GB Engram cached in DDR5 RAM in {time.time()-t_w0:.1f}s (0 disk I/O)!", flush=True)
     except Exception as e:
         print(f"[EAGER-VRAM-SEED] Warmup note: {e}", flush=True)
     os._exit(0)
+
+
+def start_caddy_auth_and_tunnel(
+    service_port=8150,
+    public_port=18080,
+    auth_user=None,
+    auth_pass=None,
+    api_token=None,
+    tunnel_mode=None,
+    tunnel_token=None,
+):
+    """
+    Optional colabllm-compatible Caddy Dual-Mode Security Layer + Cloudflare Tunnel:
+      - Browser access: HTTP Basic Auth -> sets HttpOnly `ct_session` cookie
+      - API access: `Authorization: Bearer <api_token>`
+      - Tunnel: Cloudflare Named Tunnel (if tunnel_token / CT_TUNNEL_TOKEN is provided) or Quick Tunnel (*.trycloudflare.com)
+    """
+    import hashlib
+    import platform
+    import secrets
+
+    auth_user = auth_user or os.environ.get("CT_AUTH_USER", "admin")
+    auth_pass = auth_pass or os.environ.get("CT_AUTH_PASS") or secrets.token_urlsafe(16)
+    api_token = api_token or os.environ.get("CT_API_TOKEN") or ("sk-" + secrets.token_urlsafe(24))
+    tunnel_token = tunnel_token or os.environ.get("CT_TUNNEL_TOKEN") or os.environ.get("CF_TUNNEL_TOKEN", "")
+
+    work_dir = "/tmp/ct_deepseek"
+    os.makedirs(work_dir, exist_ok=True)
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+
+    if not os.path.exists("/usr/local/bin/caddy"):
+        print("  [CADDY-AUTH] Installing Caddy binary to /usr/local/bin/caddy...", flush=True)
+        tag = json.loads(
+            urllib.request.urlopen("https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=30).read()
+        )["tag_name"]
+        tgz = "/tmp/caddy.tgz"
+        url = f"https://github.com/caddyserver/caddy/releases/download/{tag}/caddy_{tag.lstrip('v')}_linux_{arch}.tar.gz"
+        urllib.request.urlretrieve(url, tgz)
+        subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+
+    cookie_tok = hashlib.sha256(f"ct-cookie-v2:{auth_user}:{auth_pass}:{api_token}".encode()).hexdigest()
+    hashed = subprocess.check_output(["/usr/local/bin/caddy", "hash-password", "--plaintext", auth_pass], text=True).strip()
+    upstream = f"""reverse_proxy 127.0.0.1:{service_port} {{
+            header_up -Authorization
+            flush_interval -1
+        }}"""
+    caddyfile = f"""{{
+    admin off
+    auto_https off
+}}
+:{public_port} {{
+    encode zstd gzip
+    @bearer header Authorization "Bearer {api_token}"
+    handle @bearer {{
+        {upstream}
+    }}
+    @cookie header Cookie *ct_session={cookie_tok}*
+    handle @cookie {{
+        {upstream}
+    }}
+    handle {{
+        route {{
+            basic_auth {{
+                "{auth_user}" {hashed}
+            }}
+            header +Set-Cookie "ct_session={cookie_tok}; Path=/; HttpOnly; SameSite=Lax"
+            {upstream}
+        }}
+    }}
+}}
+"""
+    caddy_cfg = os.path.join(work_dir, "Caddyfile")
+    with open(caddy_cfg, "w", encoding="utf-8") as f:
+        f.write(caddyfile)
+    subprocess.run(["pkill", "-f", "caddy run"], check=False)
+    caddy_log = open(os.path.join(work_dir, "caddy.log"), "a")
+    subprocess.Popen(
+        ["/usr/local/bin/caddy", "run", "--config", caddy_cfg, "--adapter", "caddyfile"],
+        stdout=caddy_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    creds_path = os.path.join(work_dir, "credentials.json")
+    with open(creds_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "service_port": service_port,
+                "public_port": public_port,
+                "auth_user": auth_user,
+                "auth_pass": auth_pass,
+                "api_token": api_token,
+            },
+            f,
+            indent=2,
+        )
+    os.chmod(creds_path, 0o600)
+    print(f"  [CADDY-AUTH] Listening on :{public_port} -> 127.0.0.1:{service_port} (saved credentials to {creds_path})", flush=True)
+
+    if tunnel_mode or tunnel_token:
+        cf_bin = "/usr/local/bin/cloudflared"
+        if not os.path.exists(cf_bin):
+            cf_url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+            urllib.request.urlretrieve(cf_url, cf_bin)
+            os.chmod(cf_bin, 0o755)
+        subprocess.run(["pkill", "-f", "cloudflared tunnel"], check=False)
+        cf_log_path = os.path.join(work_dir, "cloudflared.log")
+        cf_log = open(cf_log_path, "w")
+        if tunnel_token:
+            cf_cmd = [cf_bin, "tunnel", "--no-autoupdate", "run", "--token", tunnel_token]
+            print("  [CF-TUNNEL] Started Named Cloudflare Tunnel via token", flush=True)
+        else:
+            cf_cmd = [cf_bin, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{public_port}"]
+            print(f"  [CF-TUNNEL] Starting Quick Tunnel -> http://127.0.0.1:{public_port} (logs: {cf_log_path})", flush=True)
+        subprocess.Popen(cf_cmd, stdout=cf_log, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def main():
@@ -463,8 +874,20 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["stage-only", "delta", "llamacpp-cpu", "llamacpp-hybrid"],
+        choices=["stage-only", "delta", "llamacpp-vision", "llamacpp-hybrid", "llamacpp-cpu"],
         default="stage-only",
+    )
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        default=False,
+        help="Switch to llama-server with --mmproj (BF16 972.2MB Vision Projector) enabled for image+text inputs",
+    )
+    parser.add_argument(
+        "--sparse-engram",
+        action="store_true",
+        default=False,
+        help="Use 128 KB sparse GGUF header for shard 6 (Engram) for fast ~65s boot when testing vision/chat",
     )
     parser.add_argument("--ctx", type=int, default=131072)
     parser.add_argument("--port", type=int, default=8150)
@@ -486,9 +909,36 @@ def main():
         default=False,
         help="Disable automatic 1-token warmup request that opens the segmented GDDR7 VRAM cache at startup",
     )
+    parser.add_argument(
+        "--auth-caddy",
+        action="store_true",
+        default=False,
+        help="Enable colabllm-style Caddy Basic Auth + Bearer Token proxy in front of the server",
+    )
+    parser.add_argument(
+        "--public-port",
+        type=int,
+        default=18080,
+        help="Public Caddy port when --auth-caddy is enabled (default: 18080)",
+    )
+    parser.add_argument(
+        "--tunnel",
+        choices=["quick", "named"],
+        default=None,
+        help="Optionally start a Cloudflare quick tunnel or named tunnel (via --tunnel-token / CT_TUNNEL_TOKEN)",
+    )
+    parser.add_argument(
+        "--tunnel-token",
+        type=str,
+        default=None,
+        help="Cloudflare Named Tunnel token (or set CT_TUNNEL_TOKEN / CF_TUNNEL_TOKEN)",
+    )
     args = parser.parse_args()
+    if args.vision and args.mode == "delta":
+        print("  [VISION MODE] Switching engine from 'delta' to 'llamacpp-vision' to enable --mmproj BF16 image inputs!", flush=True)
+        args.mode = "llamacpp-vision"
 
-    first_shard, engram_dst, v = stage_hybrid_layout(args.variant)
+    first_shard, engram_dst, v = stage_hybrid_layout(args.variant, mode=args.mode, sparse_engram=args.sparse_engram)
     cfg_path = build_delta_g4_config(
         first_shard,
         engram_dst,
@@ -524,8 +974,21 @@ def main():
                 open(srv_core, "w", encoding="utf-8").write(stxt.replace(old_line, new_line))
         subprocess.run(["fuser", "-k", f"{args.port}/tcp"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.5)
+        if args.auth_caddy or args.tunnel or args.tunnel_token or os.environ.get("CT_TUNNEL_TOKEN"):
+            start_caddy_auth_and_tunnel(
+                service_port=args.port,
+                public_port=args.public_port,
+                tunnel_mode=args.tunnel,
+                tunnel_token=args.tunnel_token,
+            )
         if not args.no_eager_seed:
-            spawn_eager_vram_seed(port=args.port, model_name=v["model_name"])
+            spawn_eager_vram_seed(
+                port=args.port,
+                model_name=v["model_name"],
+                v=v,
+                fast_v_dir=os.path.dirname(first_shard),
+                engram_dst=engram_dst,
+            )
         cmd = [
             sys.executable,
             "/content/engines/delta_serve/tools/v41/serve/serve_ds41.py",
@@ -539,30 +1002,44 @@ def main():
         print("Launching Delta Server:", " ".join(cmd))
         os.execvp(cmd[0], cmd)
 
-    elif args.mode in ("llamacpp-cpu", "llamacpp-hybrid"):
+    elif args.mode in ("llamacpp-vision", "llamacpp-cpu", "llamacpp-hybrid"):
         if v["is_gsq_4shard"]:
             first_shard = ensure_llamacpp_6shard_layout(os.path.dirname(first_shard), engram_dst)
-        ot_moe = ".ffn_.*_exps.=CPU" if args.mode == "llamacpp-cpu" else r"blk\.(2[6-9]|3[0-9])\.ffn_.*_exps\.=CPU"
+        llama_srv_bin = ensure_mainline_llamacpp_b12128()
+        bin_dir = os.path.dirname(llama_srv_bin)
+        os.environ["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
+        subprocess.run(["fuser", "-k", f"{args.port}/tcp"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        if args.auth_caddy or args.tunnel or args.tunnel_token or os.environ.get("CT_TUNNEL_TOKEN"):
+            start_caddy_auth_and_tunnel(
+                service_port=args.port,
+                public_port=args.public_port,
+                tunnel_mode=args.tunnel,
+                tunnel_token=args.tunnel_token,
+            )
+        eff_ctx = min(args.ctx, 32768) if args.mode == "llamacpp-vision" and args.ctx == 131072 else args.ctx
         cmd = [
-            "/content/engines/bin/llama-server",
+            llama_srv_bin,
             "--model",
             first_shard,
+            "--alias",
+            v["model_name"],
             "--ctx-size",
-            str(args.ctx),
+            str(eff_ctx),
             "-ngl",
             "99",
-            "--load-mode",
-            "mmap",
-            "--lazy-mode",
-            "on",
-            "--override-tensor",
-            "per_layer_token_embd.weight=CPU",
-            "-ot",
-            ot_moe,
-            "--cache-type-k",
-            "q4_0",
-            "--cache-type-v",
-            "q4_0",
+            "--jinja",
+        ]
+        # For 72.12 GB ISTA-DASLab Coder, 100% of all 40 MoE layers + 972MB mmproj fit inside 96GB GDDR7 VRAM!
+        if args.mode == "llamacpp-cpu":
+            cmd.extend(["-ot", ".ffn_.*_exps.=CPU"])
+        elif not v.get("full_engram"):
+            cmd.extend(["-ot", r"blk\.(2[6-9]|3[0-9])\.ffn_.*_exps\.=CPU"])
+        mmproj_path = v.get("mmproj_local_path")
+        if mmproj_path and os.path.exists(mmproj_path):
+            cmd.extend(["--mmproj", mmproj_path])
+            print(f"  [VISION ENABLED] Mounting BF16 Vision Projector: {mmproj_path}", flush=True)
+        cmd.extend([
             "--temp",
             "1.0",
             "--top-p",
@@ -579,7 +1056,7 @@ def main():
             "24",
             "--port",
             str(args.port),
-        ]
+        ])
         print(f"Launching llama-server ({args.mode}):", " ".join(cmd))
         os.execvp(cmd[0], cmd)
 
