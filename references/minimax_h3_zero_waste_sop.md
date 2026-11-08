@@ -14,9 +14,14 @@
 
 ---
 
-## 1. 铁律 A：备料在本地 0 CCU，点火即连发
+## 1. 铁律 A：备料在本地 0 CCU（或 0 CCU CPU 独立画布），点火即连发
 
-严禁先开着 G4 (`10.05 CCU/h`) 再去现场想剧本、生成首帧底图或调试工作流。所有耗时的人工选图、`1344×768` 哑光首帧图生成与提示词编排必须在 **G4 点火前（0 CCU）** 全部在本地备齐。
+- 严禁先开着 G4 (`10.05 CCU/h`) 再去现场想剧本、生成首帧底图或调试工作流。所有耗时的人工选图、`1344×768` 哑光首帧图生成与提示词编排必须在 **G4 点火前（0 CCU）** 全部在本地或 **0 CCU CPU 独立画布** 备齐。
+- **画布与算力解耦模式（Decoupled Control Plane + On-Demand Serverless G4）**：
+  1. **启动 0 CCU 独立画布**：在免费 CPU 会话上运行 `python3 scripts/comfy_serverless_g4_dispatcher.py canvas -s <cpu_session>`（底层调用 [`scripts/launch_cpu_canvas_comfyui.py`](../scripts/launch_cpu_canvas_comfyui.py)）。ComfyUI 以 `--cpu` 模式启动并挂载 30TB 云盘，完整加载 13 套节点菜单、模型下拉列表与历史输出，全程 **0.00 CCU/h**。
+  2. **按需弹性拉起 G4 与空闲自动关停**：
+     - 当用户在 0 CCU 网页画布点击 `Queue Prompt` 时，内置队列桥 (`127.0.0.1:8189`) 自动将工作流落盘至云盘 `serverless_queue/pending/`；
+     - 运行 `python3 scripts/comfy_serverless_g4_dispatcher.py watch --cpu-session <cpu_session> --g4-session comfy-g4 --idle-timeout 600`（或单次直接派发 `dispatch --workflow wf.json --gacha-runs 4 --auto-stop-g4`），自动拉起/复用 G4 算力实例、渲染并合成 2×2 四宫格抽卡对比视频写回云盘 `output/`，并在任务完成或空闲超时后自动释放 G4 实例并输出双轨 CCU 结算报告。
 
 ---
 

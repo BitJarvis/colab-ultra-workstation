@@ -309,6 +309,125 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                     f"Skill mirror {sp} is out of sync with root {rp}",
                 )
 
+    def test_09_decoupled_cpu_canvas_and_serverless_g4_dispatcher(self) -> None:
+        """Verify Decoupled CPU Canvas (`launch_cpu_canvas_comfyui.py`) and On-Demand G4 Dispatcher (`comfy_serverless_g4_dispatcher.py`)."""
+        import comfy_serverless_g4_dispatcher as disp
+        import launch_cpu_canvas_comfyui as cpu_canvas
+
+        # 1. Verify CPU Canvas launcher uses `--cpu`, Caddy auth on port 18188 -> bridge 8189 -> ComfyUI 8188
+        cpu_src = (REPO_ROOT / "scripts" / "launch_cpu_canvas_comfyui.py").read_text(encoding="utf-8")
+        self.assertIn('"--cpu"', cpu_src)
+        self.assertIn("def start_caddy_auth_gateway", cpu_src)
+        self.assertIn("http://127.0.0.1:18188", cpu_src)
+
+        # 2. Test `enqueue_serverless_job` validation, sanitization, and atomic file creation
+        with tempfile.TemporaryDirectory() as tmpdir:
+            q_root = Path(tmpdir) / "serverless_queue"
+            sample_wf = {
+                "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}},
+                "20": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "TestCanvas"}},
+            }
+            res = cpu_canvas.enqueue_serverless_job(
+                {"prompt": sample_wf, "prompt_id": "../../evil_id/../job123", "client_id": "web_client_1"},
+                queue_root=q_root,
+                gacha_runs=4,
+                prefix="CanvasGacha",
+            )
+            self.assertTrue(res["serverless_g4_queued"])
+            # Ensure path traversal characters were stripped from prompt_id
+            self.assertNotIn("/", res["prompt_id"])
+            self.assertNotIn(".", res["prompt_id"])
+            qfile = Path(res["queue_file"])
+            self.assertTrue(qfile.exists())
+            self.assertEqual(qfile.parent.resolve(), (q_root / "pending").resolve())
+            saved = json.loads(qfile.read_text(encoding="utf-8"))
+            self.assertEqual(saved["gacha_runs"], 4)
+            self.assertEqual(saved["prefix"], "CanvasGacha")
+            self.assertEqual(saved["status"], "pending")
+
+            # Reject empty or invalid workflows
+            with self.assertRaises(ValueError):
+                cpu_canvas.enqueue_serverless_job({"prompt": {}}, queue_root=q_root)
+            with self.assertRaises(ValueError):
+                cpu_canvas.enqueue_serverless_job({"prompt": {"nodes": [], "links": []}}, queue_root=q_root)
+
+        # 3. Test session name & GPU variant validation
+        self.assertEqual(disp.validate_session_name("c6e1c7"), "c6e1c7")
+        self.assertEqual(disp.validate_session_name("comfy-g4_01"), "comfy-g4_01")
+        for bad_sess in ("", "bad; rm -rf /", "../etc", "a" * 80):
+            with self.assertRaises(ValueError):
+                disp.validate_session_name(bad_sess)
+        self.assertEqual(disp.validate_gpu_variant("g4"), "G4")
+        with self.assertRaises(ValueError):
+            disp.validate_gpu_variant("RTX9999")
+
+        # 4. Test `ServerlessG4LifecycleController` lazy boot, reuse, dispatch, and idle auto-stop with mock runner
+        calls = []
+        state = {"alive": False, "comfy_ready": False}
+
+        def mock_runner(cmd, stdin_text=None, timeout=60.0):
+            calls.append((cmd, stdin_text))
+            cmd_str = " ".join(cmd)
+            if "sessions" in cmd:
+                return (0, "[comfy-g4] m-s-g4 | Hardware: G4" if state["alive"] else "[c6e1c7] Hardware: CPU")
+            if "new" in cmd and "--gpu" in cmd:
+                state["alive"] = True
+                return (0, "Created G4 session")
+            if "dfs" in cmd and "mount" in cmd:
+                return (0, "Mounted Drive")
+            if "upload" in cmd:
+                return (0, "Uploaded")
+            if "exec" in cmd:
+                if stdin_text and "launch_g4_comfyui_fast.py" in stdin_text:
+                    state["comfy_ready"] = True
+                    return (0, "G4_FASTBOOT_STARTED")
+                if stdin_text and "system_stats" in stdin_text:
+                    return (0, "COMFY_READY_OK" if state["comfy_ready"] else "COMFY_NOT_READY")
+                if stdin_text and "g4_job.done" in stdin_text and "Popen" not in stdin_text:
+                    return (0, json.dumps({"done": True, "rc": "0", "tail": "Gacha done"}))
+                if stdin_text and "files?{params}" in stdin_text:
+                    return (0, json.dumps({"ok": True, "missing": [], "cloud_count": 5}))
+                return (0, "OK")
+            if "colab_meter.py" in cmd_str and "stop" in cmd:
+                state["alive"] = False
+                state["comfy_ready"] = False
+                return (0, "✅ 算力释放与计费核验报告：会话 'comfy-g4' 已释放")
+            return (0, "OK")
+
+        # Patch time.sleep briefly inside controller test so unit test runs in <0.1s
+        orig_sleep = disp.time.sleep
+        disp.time.sleep = lambda _s: None
+        try:
+            ctrl = disp.ServerlessG4LifecycleController(
+                g4_session="comfy-g4",
+                cpu_session="c6e1c7",
+                gpu_variant="G4",
+                idle_timeout_sec=300,
+                auto_stop_immediately=False,
+                runner=mock_runner,
+            )
+            # First ensure_g4_ready triggers lazy provisioning (`colab new --gpu G4` + `colab dfs mount`)
+            boot_res = ctrl.ensure_g4_ready(boot_timeout_sec=30)
+            self.assertFalse(boot_res["reused"])
+            self.assertTrue(ctrl.g4_active)
+
+            # Second ensure_g4_ready reuses the warm G4 instance without re-provisioning
+            reuse_res = ctrl.ensure_g4_ready(boot_timeout_sec=30)
+            self.assertTrue(reuse_res["reused"])
+
+            # Idle check before timeout does NOT stop G4
+            self.assertIsNone(ctrl.check_idle_and_stop_if_needed(now=ctrl.last_activity_ts + 100))
+            self.assertTrue(ctrl.g4_active)
+
+            # Idle check after 305s (>= 300s) triggers Drive flush check + `colab_meter.py stop -s comfy-g4`
+            stop_res = ctrl.check_idle_and_stop_if_needed(now=ctrl.last_activity_ts + 305)
+            self.assertIsNotNone(stop_res)
+            self.assertEqual(stop_res["stopped_session"], "comfy-g4")
+            self.assertFalse(ctrl.g4_active)
+        finally:
+            disp.time.sleep = orig_sleep
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

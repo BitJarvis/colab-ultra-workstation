@@ -63,7 +63,12 @@ grep -q 'COLAB_DFS_DEFAULT=1' ~/.zshrc || echo 'export COLAB_DFS_DEFAULT=1' >> ~
    - **指定 GPU 开机**：`~/.local/bin/colab new -s <session> --gpu <G4|L4|T4|A100|H100>`
    - **跑完即焚单次任务**：`~/.local/bin/colab run <script.py> --gpu <G4|L4|T4>`
 
-2. **20TB/30TB 云盘零浏览器静默挂载与防只读/假死自愈**：
+2. **画布与算力解耦的智能弹性网关模式（0 CCU 独立画布 + 按需拉起 G4 算力，推荐首选）**：
+   - **核心设计**：利用 20TB/30TB Google Drive 共享存储，将 **ComfyUI 交互式前端画布 (`--cpu`, `0.00 CCU/h`)** 与 **96GB Blackwell G4 渲染算力引擎 (`10.05 CCU/h`)** 彻底解耦：
+     - **0 CCU 独立画布（Control Plane）**：在免费 CPU 实例上运行 [`scripts/launch_cpu_canvas_comfyui.py`](scripts/launch_cpu_canvas_comfyui.py)（或 `python3 scripts/comfy_serverless_g4_dispatcher.py canvas -s <cpu_session>`）。由于 `/content/ComfyUI/models/*` 与 `output/` 直接软链至云盘，用户在网页端拖拽节点、选择 MiniMax-H3 / Qwen3-VL / LoRA 下拉菜单、编排工作流、预览历史成片时 **GPU 消耗为 0.00 CCU/h**！
+     - **智能拦截与按需 G4 弹性执行（Compute Engine）**：点击网页端 `Queue Prompt` 时，内置队列桥 (`127.0.0.1:8189`) 自动拦截 `POST /prompt` 并写入云盘 `/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/pending/`；由 [`scripts/comfy_serverless_g4_dispatcher.py`](scripts/comfy_serverless_g4_dispatcher.py)（`watch` 守护模式或 `dispatch` 命令行模式）按需自动分配/复用 G4 实例、三路并发预热 NVMe、执行单次或 4 路并发抽卡 (`--gacha-runs 4`)、将 MP4 写回共享云盘 `output/`，并在任务完成后立即关停（`--auto-stop-g4`）或空闲超时自动关停（`--idle-timeout 600` 秒）G4 实例！
+
+3. **20TB/30TB 云盘零浏览器静默挂载与防只读/假死自愈**：
    - **CLI 模式**：`~/.local/bin/colab dfs mount -s <session>`（只读保护加 `--readonly`；FUSE 假死原地重挂加 `--force --purge-state`）。
    - **`colab-mcp` 网页模式**：运行 `python3 scripts/mcp_dfs_mount.py` 生成载荷执行，挂载成功后立即运行 `python3 scripts/mcp_dfs_mount.py --sanitize` 擦除单元格中的明文 Token。
    - **路径兼容**：自动建立软链接 `os.symlink("/content/drive/My Drive", "/content/drive/MyDrive")`。
