@@ -107,6 +107,7 @@ class ServerlessG4LifecycleController:
         self._runner = runner or self._default_runner
         self.g4_active: bool = False
         self.last_activity_ts: float = 0.0
+        self.last_output_files: List[str] = []
 
     @staticmethod
     def _default_runner(cmd: List[str], stdin_text: Optional[str] = None, timeout: float = 120.0) -> Tuple[int, str]:
@@ -285,7 +286,7 @@ except Exception as e:
         idle_for = cur - self.last_activity_ts
         if self.auto_stop_immediately or (self.idle_timeout_sec >= 0 and idle_for >= self.idle_timeout_sec):
             reason = "auto_stop_after_batch" if self.auto_stop_immediately else f"idle_{int(idle_for)}s_exceeded_{self.idle_timeout_sec}s"
-            return self.stop_g4_session(reason=reason)
+            return self.stop_g4_session(reason=reason, expected_files=getattr(self, "last_output_files", None))
         return None
 
     def dispatch_workflow_on_g4(
@@ -329,12 +330,15 @@ except Exception as e:
             norm_gcs = gacha.validate_gcs_uri(gcs_bucket)
             cmd_parts.extend(["--gcs-bucket", norm_gcs])
 
-        remote_cmd_str = " ".join(json.dumps(p) for p in cmd_parts)
+        import shlex
+        remote_cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
+        bash_payload = f"{remote_cmd_str} > /tmp/g4_job.log 2>&1; echo $? > /tmp/g4_job.done"
         launch_code = (
-            "import subprocess\n"
-            "open('/tmp/g4_job.done', 'w').close()\n"
-            "import os; os.remove('/tmp/g4_job.done')\n"
-            f"subprocess.Popen('nohup bash -c \"{remote_cmd_str} > /tmp/g4_job.log 2>&1; echo $? > /tmp/g4_job.done\" &', shell=True)\n"
+            "import os, subprocess\n"
+            "if os.path.exists('/tmp/g4_job.done'):\n"
+            "    os.remove('/tmp/g4_job.done')\n"
+            f"subprocess.Popen(['nohup', 'bash', '-c', {bash_payload!r}], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
             "print('JOB_DISPATCHED')\n"
         )
         self.colab_exec(self.g4_session, launch_code, timeout=20.0)
@@ -363,14 +367,32 @@ except Exception as e:
                             if job_rc != 0:
                                 raise RuntimeError(f"❌ G4 渲染任务失败 (rc={job_rc}):\n{tail_txt}")
                             print(f"🎉 [G4-Complete] 渲染完成 (耗时 {time.time() - t0:.1f}s)！产出已写入共享云盘 output/。", flush=True)
+                            expected_files: List[str] = []
+                            for tline in reversed(tail_txt.splitlines()):
+                                tline_s = tline.strip()
+                                if tline_s.startswith("{") and tline_s.endswith("}"):
+                                    try:
+                                        j_res = json.loads(tline_s)
+                                        for vp in j_res.get("take_videos", []) or []:
+                                            expected_files.append(Path(vp).name)
+                                        if j_res.get("grid_video"):
+                                            expected_files.append(Path(j_res["grid_video"]).name)
+                                        break
+                                    except Exception:
+                                        pass
+                            self.last_output_files = expected_files
                             result_summary: Dict[str, Any] = {
                                 "status": "completed",
                                 "g4_session": self.g4_session,
                                 "elapsed_seconds": round(time.time() - t0, 1),
+                                "expected_files": expected_files,
                                 "log_tail": tail_txt,
                             }
                             if self.auto_stop_immediately:
-                                stop_info = self.stop_g4_session(reason="auto_stop_after_batch")
+                                stop_info = self.stop_g4_session(
+                                    reason="auto_stop_after_batch",
+                                    expected_files=expected_files,
+                                )
                                 result_summary["auto_stopped"] = stop_info
                             return result_summary
 
@@ -457,7 +479,7 @@ q_pending = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue
 q_running = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/running")
 q_pending.mkdir(parents=True, exist_ok=True)
 q_running.mkdir(parents=True, exist_ok=True)
-jobs = sorted(q_pending.glob("job_*.json"), key=lambda p: p.stat().st_mtime)
+jobs = sorted(q_pending.glob("job_*.json"), key=lambda p: p.name)
 if not jobs:
     print(json.dumps({"claimed": None}))
 else:
@@ -482,19 +504,23 @@ else:
 
         if claimed_job:
             job_id = claimed_job.get("job_id", "unknown")
-            gacha_runs = int(claimed_job.get("gacha_runs") or 1)
+            gacha_runs = max(1, int(claimed_job.get("gacha_runs") or 1))
+            seed_base = int(claimed_job.get("seed_base") or 2026110801)
             prefix = claimed_job.get("prefix") or f"WebUI_{job_id[:8]}"
             running_file = claimed_job.get("running_file", "")
             print(f"⚡ [Queue-Hit] 捕获到来自 0 CCU 画布的新任务: job_id={job_id} (gacha_runs={gacha_runs})！", flush=True)
 
             tmp_wf = Path(f"/tmp/serverless_job_{job_id}.json")
             tmp_wf.write_text(json.dumps(claimed_job["prompt"], indent=2, ensure_ascii=False), encoding="utf-8")
+            expected_files = []
             try:
                 res = ctrl.dispatch_workflow_on_g4(
                     workflow_path=tmp_wf,
                     gacha_runs=gacha_runs,
+                    seed_base=seed_base,
                     prefix=prefix,
                 )
+                expected_files = res.get("expected_files", [])
                 mark_status = "completed"
                 err_msg = None
             except Exception as exc:
@@ -513,6 +539,7 @@ if src.exists():
     data = json.loads(src.read_text(encoding="utf-8"))
     data["status"] = {mark_status!r}
     data["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data["expected_files"] = {expected_files!r}
     if {err_msg!r}:
         data["error"] = {err_msg!r}
     dst = dst_dir / src.name

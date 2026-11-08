@@ -419,11 +419,64 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
             self.assertIsNone(ctrl.check_idle_and_stop_if_needed(now=ctrl.last_activity_ts + 100))
             self.assertTrue(ctrl.g4_active)
 
+            # Test dispatch_workflow_on_g4 and verify no nested double-quote truncation + expected_files extraction
+            with tempfile.TemporaryDirectory() as tmpdir:
+                wf_p = Path(tmpdir) / "test_api_wf.json"
+                wf_p.write_text(
+                    json.dumps(
+                        {
+                            "10": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}},
+                            "20": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "TestOut"}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # Update mock_runner to return a JSON summary in tail so expected_files is populated
+                orig_mock = ctrl._runner
+
+                def mock_runner_with_outputs(cmd, stdin_text=None, timeout=60.0):
+                    if "exec" in cmd and stdin_text and "Popen" in stdin_text and "comfy_gacha_and_gcp.py" in stdin_text:
+                        # Ensure bash -c is invoked via list args without broken nested double quotes
+                        self.assertIn("['nohup', 'bash', '-c',", stdin_text)
+                        self.assertIn("--workflow", stdin_text)
+                    if "exec" in cmd and stdin_text and "g4_job.done" in stdin_text and "Popen" not in stdin_text:
+                        summary_json = json.dumps(
+                            {
+                                "seeds": [101, 102],
+                                "take_videos": ["/content/drive/MyDrive/AI_Workstation/ComfyUI/output/TestOut_T01.mp4"],
+                                "grid_video": "/content/drive/MyDrive/AI_Workstation/ComfyUI/output/TestOut_Grid.mp4",
+                            }
+                        )
+                        return (0, json.dumps({"done": True, "rc": "0", "tail": f"Done\n{summary_json}"}))
+                    return orig_mock(cmd, stdin_text, timeout)
+
+                ctrl._runner = mock_runner_with_outputs
+                disp_res = ctrl.dispatch_workflow_on_g4(wf_p, gacha_runs=2, prefix="TestOut")
+                self.assertEqual(disp_res["status"], "completed")
+                self.assertEqual(disp_res["expected_files"], ["TestOut_T01.mp4", "TestOut_Grid.mp4"])
+                self.assertEqual(ctrl.last_output_files, ["TestOut_T01.mp4", "TestOut_Grid.mp4"])
+
             # Idle check after 305s (>= 300s) triggers Drive flush check + `colab_meter.py stop -s comfy-g4`
             stop_res = ctrl.check_idle_and_stop_if_needed(now=ctrl.last_activity_ts + 305)
             self.assertIsNotNone(stop_res)
             self.assertEqual(stop_res["stopped_session"], "comfy-g4")
             self.assertFalse(ctrl.g4_active)
+
+            # 5. Test concurrent FIFO multi-job queuing & watch_serverless_queue_loop sequential processing
+            with tempfile.TemporaryDirectory() as tmpdir:
+                q_root = Path(tmpdir) / "serverless_queue"
+                wf_a = {"1": {"class_type": "RandomNoise", "inputs": {"noise_seed": 1}}}
+                wf_b = {"1": {"class_type": "RandomNoise", "inputs": {"noise_seed": 2}}}
+                wf_c = {"1": {"class_type": "RandomNoise", "inputs": {"noise_seed": 3}}}
+                r1 = cpu_canvas.enqueue_serverless_job({"prompt": wf_a, "prompt_id": "jobA"}, queue_root=q_root, prefix="PrefA")
+                r2 = cpu_canvas.enqueue_serverless_job({"prompt": wf_b, "prompt_id": "jobB"}, queue_root=q_root, prefix="PrefB")
+                r3 = cpu_canvas.enqueue_serverless_job({"prompt": wf_c, "prompt_id": "jobC"}, queue_root=q_root, prefix="PrefC")
+                # Even if called in the same millisecond, filenames are strictly ordered
+                pending_names = [p.name for p in sorted((q_root / "pending").glob("job_*.json"), key=lambda p: p.name)]
+                self.assertEqual(len(pending_names), 3)
+                self.assertTrue(pending_names[0].endswith("_jobA.json"))
+                self.assertTrue(pending_names[1].endswith("_jobB.json"))
+                self.assertTrue(pending_names[2].endswith("_jobC.json"))
         finally:
             disp.time.sleep = orig_sleep
 

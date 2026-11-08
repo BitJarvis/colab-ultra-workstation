@@ -80,6 +80,9 @@ def get_queue_dirs(queue_root: Path = SERVERLESS_QUEUE_DIR) -> Dict[str, Path]:
     return dirs
 
 
+_LAST_TS_MS = 0
+
+
 def enqueue_serverless_job(
     prompt_payload: Dict[str, Any],
     queue_root: Path = SERVERLESS_QUEUE_DIR,
@@ -89,6 +92,7 @@ def enqueue_serverless_job(
     prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Serialize a ComfyUI `/prompt` request into the shared Drive `serverless_queue/pending/` folder."""
+    global _LAST_TS_MS
     if not isinstance(prompt_payload, dict):
         raise ValueError("Invalid prompt payload: expected JSON object.")
     workflow = prompt_payload.get("prompt") if "prompt" in prompt_payload else prompt_payload
@@ -102,7 +106,8 @@ def enqueue_serverless_job(
     job_id = str(prompt_payload.get("prompt_id") or uuid.uuid4())
     # Sanitize job_id to prevent any filename traversal
     safe_job_id = re.sub(r"[^a-zA-Z0-9_-]", "", job_id) or uuid.uuid4().hex
-    ts_ms = int(time.time() * 1000)
+    ts_ms = max(int(time.time() * 1000), _LAST_TS_MS + 1)
+    _LAST_TS_MS = ts_ms
 
     extra_data = prompt_payload.get("extra_data", {})
     if not isinstance(extra_data, dict):
@@ -337,13 +342,23 @@ for _sub in ("pending", "running", "completed", "failed"):
     (QUEUE_ROOT / _sub).mkdir(parents=True, exist_ok=True)
 
 
+_LAST_TS_MS = 0
+
+
 def _enqueue_job(payload: dict) -> dict:
+    global _LAST_TS_MS
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid prompt payload: expected JSON object.")
     workflow = payload.get("prompt") if "prompt" in payload else payload
     if not isinstance(workflow, dict) or not workflow:
         raise ValueError("Missing non-empty 'prompt' workflow in request.")
+    has_api_nodes = any(isinstance(v, dict) and "class_type" in v for v in workflow.values())
+    if not has_api_nodes:
+        raise ValueError("Prompt workflow does not contain valid ComfyUI API nodes ('class_type').")
     raw_id = str(payload.get("prompt_id") or uuid.uuid4())
     job_id = re.sub(r"[^a-zA-Z0-9_-]", "", raw_id) or uuid.uuid4().hex
-    ts_ms = int(time.time() * 1000)
+    ts_ms = max(int(time.time() * 1000), _LAST_TS_MS + 1)
+    _LAST_TS_MS = ts_ms
     record = {{
         "job_id": job_id,
         "prompt_id": job_id,
@@ -351,7 +366,9 @@ def _enqueue_job(payload: dict) -> dict:
         "timestamp_ms": ts_ms,
         "source": "cpu_webui",
         "status": "pending",
-        "gacha_runs": int(payload.get("gacha_runs", 1)),
+        "gacha_runs": max(1, int(payload.get("gacha_runs", 1))),
+        "seed_base": payload.get("seed_base"),
+        "prefix": payload.get("prefix"),
         "client_id": payload.get("client_id"),
         "prompt": workflow,
         "extra_data": payload.get("extra_data", {{}}),
@@ -440,7 +457,7 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
             except Exception as exc:
                 return web.json_response({{"error": str(exc), "node_errors": {{}}}}, status=400)
 
-    # 4. Augment `/history` with completed Serverless G4 jobs so Web UI can inspect them
+    # 4. Augment `/history` or `/api/history` with completed/failed Serverless G4 jobs so Web UI can inspect them
     session: aiohttp.ClientSession = request.app["client_session"]
     target_url = f"{{COMFY_UPSTREAM}}{{path_qs}}"
     body_bytes = await request.read() if request.can_read_body else None
@@ -452,6 +469,36 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
             k: v for k, v in resp.headers.items()
             if k.lower() not in ("content-encoding", "transfer-encoding", "content-length")
         }}
+        if request.method == "GET" and (path.startswith("/history") or path.startswith("/api/history")) and resp.status == 200:
+            try:
+                hist_obj = json.loads(resp_body.decode("utf-8"))
+                if isinstance(hist_obj, dict):
+                    filter_id = path.rstrip("/").split("/")[-1]
+                    if filter_id in ("history", ""):
+                        filter_id = None
+                    for st in ("completed", "failed"):
+                        for jf in (QUEUE_ROOT / st).glob("job_*.json"):
+                            try:
+                                jdata = json.loads(jf.read_text(encoding="utf-8"))
+                                pid = jdata.get("prompt_id") or jdata.get("job_id")
+                                if not pid or (filter_id and pid != filter_id) or pid in hist_obj:
+                                    continue
+                                hist_obj[pid] = {{
+                                    "prompt": [jdata.get("timestamp_ms", 0), pid, jdata.get("prompt", {{}}), jdata.get("extra_data", {{}}), []],
+                                    "outputs": jdata.get("outputs", {{}}),
+                                    "status": {{
+                                        "status_str": "success" if st == "completed" else "error",
+                                        "completed": st == "completed",
+                                        "serverless_g4": True,
+                                        "expected_files": jdata.get("expected_files", []),
+                                        "error": jdata.get("error"),
+                                    }},
+                                }}
+                            except Exception:
+                                pass
+                    return web.json_response(hist_obj, status=200)
+            except Exception:
+                pass
         return web.Response(body=resp_body, status=resp.status, headers=out_headers)
 
 
