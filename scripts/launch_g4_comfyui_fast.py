@@ -484,6 +484,8 @@ def start_caddy_auth_gateway(service_port: int = 8188, public_port: int = 18188)
     hashed = subprocess.check_output(["/usr/local/bin/caddy", "hash-password", "--plaintext", auth_pass], text=True).strip()
     upstream = f"""reverse_proxy 127.0.0.1:{service_port} {{
             header_up -Authorization
+            header_up -Origin
+            header_up -Sec-Fetch-Site
             flush_interval -1
         }}"""
     caddyfile = f"""{{

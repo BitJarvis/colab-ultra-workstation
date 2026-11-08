@@ -314,11 +314,17 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
         import comfy_serverless_g4_dispatcher as disp
         import launch_cpu_canvas_comfyui as cpu_canvas
 
-        # 1. Verify CPU Canvas launcher uses `--cpu`, Caddy auth on port 18188 -> bridge 8189 -> ComfyUI 8188
+        # 1. Verify CPU Canvas launcher uses `--cpu`, Caddy auth on port 18188 -> bridge 8189 + direct ComfyUI 8188,
+        #    strips Origin/Sec-Fetch-Site to prevent ComfyUI v0.44+ 403 CSRF rejections, and initializes user/default + user.css
         cpu_src = (REPO_ROOT / "scripts" / "launch_cpu_canvas_comfyui.py").read_text(encoding="utf-8")
         self.assertIn('"--cpu"', cpu_src)
         self.assertIn("def start_caddy_auth_gateway", cpu_src)
         self.assertIn("http://127.0.0.1:18188", cpu_src)
+        self.assertIn("path /prompt /api/prompt /history* /api/history* /serverless/* /api/serverless/*", cpu_src)
+        self.assertIn("header_up -Origin", cpu_src)
+        self.assertIn("header_up -Sec-Fetch-Site", cpu_src)
+        self.assertIn("user.css", cpu_src)
+        self.assertIn(".index.json", cpu_src)
 
         # 2. Test `enqueue_serverless_job` validation, sanitization, and atomic file creation
         with tempfile.TemporaryDirectory() as tmpdir:

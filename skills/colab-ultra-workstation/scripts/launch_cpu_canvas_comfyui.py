@@ -309,6 +309,36 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         f"uv pip install --system -q -r {LOCAL_COMFY}/requirements.txt {pkgs}; "
         f"else pip install -q -r {LOCAL_COMFY}/requirements.txt {pkgs}; fi"
     )
+
+    # Bootstrap default user files & static user.css so ComfyUI Frontend v1.58+ never 404s on initial page load
+    user_default = LOCAL_COMFY / "user" / "default"
+    (user_default / "workflows").mkdir(parents=True, exist_ok=True)
+    (user_default / "subgraphs").mkdir(parents=True, exist_ok=True)
+    for wf_src_root in (DRIVE_WORKSTATION / "workflows",):
+        if wf_src_root.exists():
+            for wf_path in wf_src_root.rglob("*.json"):
+                if "workflow" in wf_path.name.lower() and "api" not in wf_path.name.lower():
+                    dst_wf = user_default / "workflows" / wf_path.name
+                    if not dst_wf.exists():
+                        shutil.copy2(wf_path, dst_wf)
+    default_files = {
+        user_default / "user.css": "/* ComfyUI user custom stylesheet */\n",
+        user_default / "comfy.settings.json": "{}\n",
+        user_default / "comfy.templates.json": "[]\n",
+        user_default / "workflows" / ".index.json": "{}\n",
+    }
+    for fpath, default_content in default_files.items():
+        if not fpath.exists():
+            fpath.write_text(default_content, encoding="utf-8")
+    try:
+        import comfyui_frontend_package  # type: ignore
+
+        static_root = Path(comfyui_frontend_package.__file__).resolve().parent / "static"
+        if static_root.is_dir() and not (static_root / "user.css").exists():
+            (static_root / "user.css").write_text("/* ComfyUI user custom stylesheet */\n", encoding="utf-8")
+    except Exception:
+        pass
+
     print(f"✅ 0 CCU CPU 独立画布环境与云盘模型目录软链初始化完成 (耗时 {time.time() - t0:.1f}s)", flush=True)
 
 
@@ -426,7 +456,10 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
         ws_server = web.WebSocketResponse()
         await ws_server.prepare(request)
         session: aiohttp.ClientSession = request.app["client_session"]
-        async with session.ws_connect(f"{{COMFY_WS_UPSTREAM}}{{path_qs}}") as ws_client:
+        async with session.ws_connect(
+            f"{{COMFY_WS_UPSTREAM}}{{path_qs}}",
+            origin=COMFY_UPSTREAM,
+        ) as ws_client:
             async def _c2s():
                 async for msg in ws_server:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -461,7 +494,10 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
     session: aiohttp.ClientSession = request.app["client_session"]
     target_url = f"{{COMFY_UPSTREAM}}{{path_qs}}"
     body_bytes = await request.read() if request.can_read_body else None
-    headers = {{k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}}
+    headers = {{
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "origin", "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest")
+    }}
 
     async with session.request(request.method, target_url, headers=headers, data=body_bytes, allow_redirects=False) as resp:
         resp_body = await resp.read()
@@ -532,8 +568,8 @@ if __name__ == "__main__":
     )
 
 
-def start_caddy_auth_gateway(service_port: int = 8189, public_port: int = 18188) -> dict:
-    """Launch Caddy Dual-Mode Security Layer (Basic Auth + Cookie + Bearer Token) in front of the CPU Canvas Bridge."""
+def start_caddy_auth_gateway(service_port: int = 8189, public_port: int = 18188, comfy_port: int = 8188) -> dict:
+    """Launch Caddy Dual-Mode Security Layer (Basic Auth + Cookie + Bearer Token) in front of the CPU Canvas Bridge & ComfyUI."""
     work_dir = Path("/tmp/ct_comfyui")
     work_dir.mkdir(parents=True, exist_ok=True)
     creds_path = work_dir / "credentials.json"
@@ -562,10 +598,25 @@ def start_caddy_auth_gateway(service_port: int = 8189, public_port: int = 18188)
 
     cookie_tok = hashlib.sha256(f"ct-comfy-v2:{auth_user}:{auth_pass}:{api_token}".encode()).hexdigest()
     hashed = subprocess.check_output(["/usr/local/bin/caddy", "hash-password", "--plaintext", auth_pass], text=True).strip()
-    upstream = f"""reverse_proxy 127.0.0.1:{service_port} {{
-            header_up -Authorization
-            flush_interval -1
-        }}"""
+    upstream = f"""@bridge_routes {{
+                path /prompt /api/prompt /history* /api/history* /serverless/* /api/serverless/*
+            }}
+            handle @bridge_routes {{
+                reverse_proxy 127.0.0.1:{service_port} {{
+                    header_up -Authorization
+                    header_up -Origin
+                    header_up -Sec-Fetch-Site
+                    flush_interval -1
+                }}
+            }}
+            handle {{
+                reverse_proxy 127.0.0.1:{comfy_port} {{
+                    header_up -Authorization
+                    header_up -Origin
+                    header_up -Sec-Fetch-Site
+                    flush_interval -1
+                }}
+            }}"""
     caddyfile = f"""{{
     admin off
     auto_https off
@@ -574,11 +625,15 @@ def start_caddy_auth_gateway(service_port: int = 8189, public_port: int = 18188)
     encode zstd gzip
     @bearer header Authorization "Bearer {api_token}"
     handle @bearer {{
-        {upstream}
+        route {{
+            {upstream}
+        }}
     }}
     @cookie header Cookie *ct_comfy_session={cookie_tok}*
     handle @cookie {{
-        {upstream}
+        route {{
+            {upstream}
+        }}
     }}
     handle {{
         route {{
