@@ -44,6 +44,7 @@ NODES_BUNDLE_ARCHIVE = DRIVE_COMFY / "custom_nodes_bundle.tar.gz"
 DRIVE_CHANNEL_MODELS = [
     ("vae", "minimax_h3_video_vae_fp16.safetensors"),
     ("vae", "minimax_h3_audio_vae_fp32.safetensors"),
+    ("loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
     ("loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
     ("loras", "h3-realism-people-t2v-i2v-r2v.safetensors"),
     ("loras", "minimax-h3-facial-realism-closeup-cp2000.safetensors"),
@@ -95,6 +96,74 @@ HF_PROFILES = {
         ),
     ],
 }
+
+# Cross-workflow & official ComfyUI template model alias table:
+# Maps `(target_folder, alias_relpath)` -> `(source_folder, canonical_filename)` so every workflow
+# in `workflows/` and every official ComfyUI MiniMax-H3 template resolves with zero missing-model warnings.
+MODEL_COMPAT_ALIASES: list[tuple[str, str, str, str]] = [
+    # Diffusion Models & UNet aliases -> Singularity v1.3 ref2va INT8 or Official fl2va FP8
+    ("diffusion_models", "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_h3_ref2va_int8_convrot.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_h3_ref2va_pruned_w4a8_mixed.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_h3_r2va_veda_preview_fp8.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "fasth3_omniref_8step_pruned_int8_convrot.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("diffusion_models", "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    ("diffusion_models", "minimax_h3_fl2va_int8_convrot.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    ("diffusion_models", "minimax_h3_fl2va_pruned_bf16.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    ("diffusion_models", "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    ("diffusion_models", "fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    # Also expose under `unet` for legacy UNETLoader / custom nodes
+    ("unet", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    ("unet", "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+    ("unet", "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+    # Text Encoders & CLIP aliases -> Qwen3-VL-32B NVFP4 / INT8
+    ("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("text_encoders", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors"),
+    ("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("text_encoders", "p-h3-image_text_encoder_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors"),
+    ("text_encoders", "p-h3-image_prompt_upsampler_w4a8.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("clip", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("clip", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    ("clip", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors"),
+    ("clip", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors", "text_encoders", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors"),
+    ("clip", "qwen3vl_4b_fp8_scaled.safetensors", "text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+    # VAE aliases -> Video VAE FP16
+    ("vae", "minimax_h3_video_vae_int8_convrot.safetensors", "vae", "minimax_h3_video_vae_fp16.safetensors"),
+    ("vae", "p-h3-image_vae_int8_convrot.safetensors", "vae", "minimax_h3_video_vae_fp16.safetensors"),
+    ("vae_approx", "taeh3.safetensors", "vae", "minimax_h3_video_vae_fp16.safetensors"),
+    # LoRA aliases -> Turbo 4-step / 8-step & Realism LoRAs
+    ("loras", "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "Minimax_H3/minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "TaoMate-H3-3step-ComfyUI.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "minimax_h3_turbo_4step_ema_ckpt850.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "MiniMaxH3_fl2va_pruned_turbo_lora_larryvrh_4step_ema_ckpt850.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+    ("loras", "MiniMax H3/fasth3_v1_dense_datafree_comfyui.safetensors", "loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+    ("loras", "fasth3_v1_dense_datafree_comfyui.safetensors", "loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+    ("loras", "pika_h3_flex_fl2va_v1_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+    ("loras", "pika_h3_flex_ref2va_v1_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+    ("loras", "p-h3-image_lora_bf16.safetensors", "loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+    ("loras", "minimax_h3_lms_v1.0_r64.safetensors", "loras", "h3-realism-people-t2v-i2v-r2v.safetensors"),
+    # Latent Upscalers (`latent_upscale_models` and `h3_latent_upscalers`)
+    ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_bf16.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_fp16.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_fp32.pth", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("latent_upscale_models", "h3_clean_latent_upscaler_film_epoch200.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_bf16.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_fp16.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_fp32.pth", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    ("h3_latent_upscalers", "h3_clean_latent_upscaler_film_epoch200.safetensors", "latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+    # Embeddings & Semantic Bridge / Model Patches
+    ("embeddings", "minimaxh3_art_is_explosion.safetensors", "embeddings", "minimaxh3_bullet_time.safetensors"),
+    ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors"),
+    ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+    ("model_patches", "minimax_h3_fun_controlnet_union_pruned_int8_convrot.safetensors", "model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+]
 
 
 def sh(cmd: str) -> str:
@@ -409,12 +478,25 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         encoding="utf-8",
     )
 
-    # Symlink output directly to Drive for persistent MP4 saving
+    # Symlink output and input directly to Drive for persistent MP4 saving & shared Web UI reference images
     (DRIVE_COMFY / "output" / "latents").mkdir(parents=True, exist_ok=True)
-    out_target = LOCAL_COMFY / "output"
-    if out_target.is_symlink() or out_target.exists():
-        sh(f"rm -rf {out_target}")
-    os.symlink(DRIVE_COMFY / "output", out_target)
+    (DRIVE_COMFY / "input").mkdir(parents=True, exist_ok=True)
+    for shared_dir in ("output", "input"):
+        target_link = LOCAL_COMFY / shared_dir
+        if target_link.is_symlink() or target_link.exists():
+            sh(f"rm -rf {target_link}")
+        os.symlink(DRIVE_COMFY / shared_dir, target_link)
+
+    # Patch TimbreAudioLoader in ComfyUI-Index-TTS to cache its directory glob scan instead of re-globbing on every /object_info
+    timbre_loader = local_cn / "ComfyUI-Index-TTS" / "timbre_audio_loader.py"
+    if timbre_loader.exists():
+        t_txt = timbre_loader.read_text(encoding="utf-8", errors="ignore")
+        if "if not cls.audio_files_cache:" not in t_txt and "cls.scan_timbre_audio_files()" in t_txt:
+            t_txt = t_txt.replace(
+                "        cls.scan_timbre_audio_files()",
+                "        if not cls.audio_files_cache:\n            cls.scan_timbre_audio_files()",
+            )
+            timbre_loader.write_text(t_txt, encoding="utf-8")
 
     # Use uv if available for 3x faster dependency installation, fallback to pip
     pkgs = "gguf imageio-ffmpeg librosa soundfile tiktoken sentencepiece sox accelerate einops ultralytics onnxruntime-gpu opencv-python-headless scipy"
@@ -426,26 +508,58 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     print(f"✅ 本地 SSD ComfyUI 核心与 13 节点镜像初始化完成 (耗时 {time.time() - t0:.1f}s)", flush=True)
 
 
-def wire_hybrid_models_dir() -> None:
-    """Create /content/ComfyUI/models with symlinks preferring local NVMe SSD files and falling back to Drive."""
-    models_root = LOCAL_COMFY / "models"
-    if models_root.is_symlink() or models_root.exists():
-        sh(f"rm -rf {models_root}")
-    models_root.mkdir(parents=True, exist_ok=True)
+def wire_hybrid_models_dir(
+    local_models_root: Path = LOCAL_COMFY / "models",
+    drive_models_root: Path = DRIVE_COMFY / "models",
+    fast_models_root: Path | None = FAST_MODELS,
+) -> int:
+    """Create `/content/ComfyUI/models` with local symlinks preferring NVMe SSD files, falling back to Drive, plus all compatibility aliases."""
+    if local_models_root.is_symlink() or local_models_root.exists():
+        sh(f"rm -rf '{local_models_root}'")
+    local_models_root.mkdir(parents=True, exist_ok=True)
 
-    drive_models = DRIVE_COMFY / "models"
-    for drive_sub in drive_models.iterdir():
-        if not drive_sub.is_dir():
+    linked_count = 0
+    if drive_models_root.exists():
+        for drive_sub in drive_models_root.iterdir():
+            if not drive_sub.is_dir():
+                continue
+            local_sub = local_models_root / drive_sub.name
+            local_sub.mkdir(parents=True, exist_ok=True)
+            for item in drive_sub.iterdir():
+                target = item
+                if fast_models_root is not None:
+                    nvme_candidate = fast_models_root / drive_sub.name / item.name
+                    if nvme_candidate.exists():
+                        target = nvme_candidate
+                link_path = local_sub / item.name
+                if link_path.exists() or link_path.is_symlink():
+                    link_path.unlink()
+                os.symlink(target, link_path)
+                linked_count += 1
+
+    # Create compatibility alias symlinks on the local filesystem (since Google Drive FUSE does not support POSIX symlinks)
+    for dst_sub, alias_rel, src_sub, canonical_name in MODEL_COMPAT_ALIASES:
+        src_target = None
+        if fast_models_root is not None:
+            nvme_cand = fast_models_root / src_sub / canonical_name
+            if nvme_cand.exists():
+                src_target = nvme_cand
+        if src_target is None:
+            drive_cand = drive_models_root / src_sub / canonical_name
+            if drive_cand.exists():
+                src_target = drive_cand
+        if src_target is None:
+            local_cand = local_models_root / src_sub / canonical_name
+            if local_cand.exists():
+                src_target = local_cand
+        if src_target is None:
             continue
-        local_sub = models_root / drive_sub.name
-        local_sub.mkdir(parents=True, exist_ok=True)
-        for item in drive_sub.iterdir():
-            nvme_candidate = FAST_MODELS / drive_sub.name / item.name
-            target = nvme_candidate if nvme_candidate.exists() else item
-            link_path = local_sub / item.name
-            if link_path.exists() or link_path.is_symlink():
-                link_path.unlink()
-            os.symlink(target, link_path)
+        alias_path = local_models_root / dst_sub / alias_rel
+        alias_path.parent.mkdir(parents=True, exist_ok=True)
+        if not alias_path.exists() and not alias_path.is_symlink():
+            os.symlink(src_target, alias_path)
+            linked_count += 1
+    return linked_count
 
 
 def start_caddy_auth_gateway(service_port: int = 8188, public_port: int = 18188) -> dict:
@@ -611,6 +725,7 @@ def main() -> None:
             "--highvram",
             "--disable-mmap",
             "--fast",
+            "--enable-compress-response-body",
         ],
         cwd=str(LOCAL_COMFY),
         stdout=comfy_log,
@@ -627,7 +742,7 @@ def main() -> None:
             )
         cf_log = open("/tmp/cloudflared.log", "w")
         subprocess.Popen(
-            ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:18188"],
+            ["/usr/local/bin/cloudflared", "tunnel", "--protocol", "http2", "--url", "http://127.0.0.1:18188"],
             stdout=cf_log,
             stderr=subprocess.STDOUT,
         )

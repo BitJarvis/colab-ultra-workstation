@@ -48,20 +48,27 @@ GCS_URI_RE = re.compile(r"^gs://[a-z0-9][a-z0-9._-]{1,61}[a-z0-9](/[^\s]*)?$")
 
 
 def _format_gacha_prefix(orig_prefix: str, tag: str, base_prefix: Optional[str] = None) -> str:
-    """Format an output `filename_prefix` or `checkpoint_name` stem with `tag` while preserving `_SegXX` suffix ordering.
+    """Format an output `filename_prefix` or `checkpoint_name` stem with `tag` while preserving subfolder and `_SegXX` suffix ordering.
 
     Example:
       - `DouyinDance_15s_V1_Seg01` + `GachaT01_S1001` -> `DouyinDance_15s_V1_GachaT01_S1001_Seg01`
         (so `stitch_available_segments(f"{prefix}_{tag}", ...)` finds `{prefix}_{tag}_Seg01*.mp4`!)
       - `ComfyUI` + `GachaT01_S1001` (with `base_prefix="WanGacha"`) -> `WanGacha_ComfyUI_GachaT01_S1001`
+      - `video/MiniMax_H3` + `GachaT01_S1001` (with `base_prefix="WebUI_abc"`) -> `video/WebUI_abc_MiniMax_H3_GachaT01_S1001`
     """
-    pref = orig_prefix
-    if base_prefix and not pref.startswith(base_prefix):
-        pref = f"{base_prefix}_{pref}"
-    m = SEG_SUFFIX_RE.match(pref)
+    norm = str(orig_prefix or "ComfyUI").replace("\\", "/")
+    if "/" in norm:
+        parent_dir, leaf = norm.rsplit("/", 1)
+    else:
+        parent_dir, leaf = "", norm
+    if base_prefix and not leaf.startswith(base_prefix):
+        leaf = f"{base_prefix}_{leaf}"
+    m = SEG_SUFFIX_RE.match(leaf)
     if m:
-        return f"{m.group(1)}_{tag}{m.group(2)}"
-    return f"{pref}_{tag}"
+        formatted_leaf = f"{m.group(1)}_{tag}{m.group(2)}"
+    else:
+        formatted_leaf = f"{leaf}_{tag}"
+    return f"{parent_dir}/{formatted_leaf}" if parent_dir else formatted_leaf
 
 
 def validate_gcs_uri(uri: str) -> str:
@@ -456,10 +463,11 @@ def _python_gcs_upload_fallback(local_paths: List[str], gcs_uri: str, project_id
 def find_latest_output_video(prefix: str, search_dirs: List[Path]) -> Optional[Path]:
     """Find the most recently modified `.mp4` or `.webp` or `.png` matching `prefix` across ComfyUI output dirs."""
     candidates: List[Path] = []
+    leaf_prefix = Path(str(prefix).replace("\\", "/")).name
     for d in search_dirs:
         if d.exists():
             for ext in ("*.mp4", "*.webp", "*.gif", "*.png"):
-                candidates.extend([p for p in d.rglob(f"{prefix}*{ext}") if "_hist_" not in p.name])
+                candidates.extend([p for p in d.rglob(f"{leaf_prefix}*{ext}") if "_hist_" not in p.name])
     if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime)
@@ -526,6 +534,7 @@ def run_batch_gacha_workflow(
     out_root.mkdir(parents=True, exist_ok=True)
 
     take_videos: List[Path] = []
+    last_outputs: Dict[str, Any] = {}
     for idx, seed in enumerate(seeds, start=1):
         mut_wf, prefixes = mutate_workflow_for_gacha_take(
             raw_wf,
@@ -535,13 +544,21 @@ def run_batch_gacha_workflow(
             target_seg_id=target_seg_id,
         )
         label = f"Gacha Take #{idx}/{len(seeds)} (seed={seed})"
-        submit_comfy_prompt_and_wait(mut_wf, label=label, api_url=api_url)
+        hist_entry = submit_comfy_prompt_and_wait(mut_wf, label=label, api_url=api_url)
+        if isinstance(hist_entry, dict) and isinstance(hist_entry.get("outputs"), dict):
+            last_outputs = hist_entry["outputs"]
         if prefixes:
             vid = find_latest_output_video(prefixes[-1], search_dirs)
             if vid:
                 dst_vid = out_root / vid.name
-                if vid.resolve() != dst_vid.resolve():
-                    shutil.copy2(vid, dst_vid)
+                try:
+                    if not vid.resolve().is_relative_to(out_root.resolve()):
+                        shutil.copy2(vid, dst_vid)
+                    else:
+                        dst_vid = vid
+                except Exception:
+                    if vid.resolve() != dst_vid.resolve():
+                        shutil.copy2(vid, dst_vid)
                 take_videos.append(dst_vid)
                 print(f"  🎞️ Take #{idx} (seed={seed}) -> {dst_vid}", flush=True)
 
@@ -569,6 +586,7 @@ def run_batch_gacha_workflow(
         "seeds": seeds,
         "take_videos": [str(p) for p in take_videos],
         "grid_video": str(grid_mp4) if grid_mp4 else None,
+        "outputs": last_outputs,
     }
 
 
@@ -630,7 +648,7 @@ def main() -> None:
             gcp_project=args.gcp_project,
             gcp_sa_json=args.gcp_sa_json,
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        print(json.dumps(res, ensure_ascii=False), flush=True)
 
     elif args.cmd == "grid":
         vids = [Path(v) for v in args.videos]

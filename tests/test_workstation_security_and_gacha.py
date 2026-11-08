@@ -313,18 +313,88 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
         """Verify Decoupled CPU Canvas (`launch_cpu_canvas_comfyui.py`) and On-Demand G4 Dispatcher (`comfy_serverless_g4_dispatcher.py`)."""
         import comfy_serverless_g4_dispatcher as disp
         import launch_cpu_canvas_comfyui as cpu_canvas
+        import launch_g4_comfyui_fast as g4_fast
 
         # 1. Verify CPU Canvas launcher uses `--cpu`, Caddy auth on port 18188 -> bridge 8189 + direct ComfyUI 8188,
-        #    strips Origin/Sec-Fetch-Site to prevent ComfyUI v0.44+ 403 CSRF rejections, and initializes user/default + user.css
+        #    strips Origin/Sec-Fetch-Site to prevent ComfyUI v0.44+ 403 CSRF rejections, sets static Cache-Control,
+        #    uses --protocol http2 for cloudflared, and initializes user/default + user.css on local SSD
         cpu_src = (REPO_ROOT / "scripts" / "launch_cpu_canvas_comfyui.py").read_text(encoding="utf-8")
         self.assertIn('"--cpu"', cpu_src)
+        self.assertIn('"--enable-compress-response-body"', cpu_src)
+        self.assertIn('"--protocol", "http2"', cpu_src)
         self.assertIn("def start_caddy_auth_gateway", cpu_src)
         self.assertIn("http://127.0.0.1:18188", cpu_src)
-        self.assertIn("path /prompt /api/prompt /history* /api/history* /serverless/* /api/serverless/*", cpu_src)
+        self.assertIn("path /ws* /prompt /api/prompt /queue* /api/queue* /history* /api/history* /api/jobs* /view* /api/view* /serverless/* /api/serverless/*", cpu_src)
+        self.assertIn('header @static_cache Cache-Control "public, max-age=86400"', cpu_src)
         self.assertIn("header_up -Origin", cpu_src)
         self.assertIn("header_up -Sec-Fetch-Site", cpu_src)
         self.assertIn("user.css", cpu_src)
         self.assertIn(".index.json", cpu_src)
+
+        # 1b. Verify `wire_local_models_with_aliases` and `wire_hybrid_models_dir` resolve all expected MiniMax-H3 workflow/template filenames
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            fake_drive_models = tmp_root / "drive_models"
+            fake_fast_models = tmp_root / "fast_models"
+            fake_local_models_cpu = tmp_root / "local_models_cpu"
+            fake_local_models_g4 = tmp_root / "local_models_g4"
+
+            canonical_files = [
+                ("diffusion_models", "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"),
+                ("diffusion_models", "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+                ("text_encoders", "qwen3vl_32b_heretic_minimax_h3_nvfp4.safetensors"),
+                ("text_encoders", "qwen3vl_32b_minimax_h3_ultra_uncensored_heretic_int8_convrot.safetensors"),
+                ("vae", "minimax_h3_video_vae_fp16.safetensors"),
+                ("vae", "minimax_h3_audio_vae_fp32.safetensors"),
+                ("loras", "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"),
+                ("loras", "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"),
+                ("loras", "h3-realism-people-t2v-i2v-r2v.safetensors"),
+                ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"),
+                ("embeddings", "minimaxh3_bullet_time.safetensors"),
+                ("model_patches", "BUNNY_H3_ActionLogic_Bridge_V1.safetensors"),
+                ("model_patches", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+            ]
+            for sub, fname in canonical_files:
+                p = fake_drive_models / sub / fname
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"weights")
+
+            # Also put one weight in fast_models to verify NVMe preference on G4
+            nvme_ref = fake_fast_models / "diffusion_models" / "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors"
+            nvme_ref.parent.mkdir(parents=True, exist_ok=True)
+            nvme_ref.write_bytes(b"nvme_weights")
+
+            cnt_cpu = cpu_canvas.wire_local_models_with_aliases(fake_local_models_cpu, fake_drive_models)
+            cnt_g4 = g4_fast.wire_hybrid_models_dir(fake_local_models_g4, fake_drive_models, fake_fast_models)
+            self.assertGreaterEqual(cnt_cpu, 40)
+            self.assertGreaterEqual(cnt_g4, 40)
+
+            expected_aliases = [
+                ("diffusion_models", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
+                ("diffusion_models", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+                ("unet", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
+                ("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
+                ("clip", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
+                ("vae", "minimax_h3_video_vae_int8_convrot.safetensors"),
+                ("loras", "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"),
+                ("loras", "Minimax_H3/minimax_h3_fl2v_lightx2v_turbo_4step_v0.1_comfy.safetensors"),
+                ("latent_upscale_models", "minimax_h3_latent_upscaler_3d_bf16.safetensors"),
+                ("h3_latent_upscalers", "minimax_h3_latent_upscaler_3d_bf16.safetensors"),
+                ("semantic_bridge", "BUNNY_H3_ActionLogic_Bridge_V2.safetensors"),
+            ]
+            for sub, alias_rel in expected_aliases:
+                self.assertTrue((fake_local_models_cpu / sub / alias_rel).exists(), f"Missing CPU alias {sub}/{alias_rel}")
+                self.assertTrue((fake_local_models_g4 / sub / alias_rel).exists(), f"Missing G4 alias {sub}/{alias_rel}")
+
+            # Verify G4 alias points to fast_models when staged on NVMe
+            self.assertEqual(
+                (fake_local_models_g4 / "diffusion_models" / "minimax_h3_ref2va_pruned_int8_convrot.safetensors").resolve(),
+                nvme_ref.resolve(),
+            )
+
+        # 1c. Verify `_format_gacha_prefix` preserves subfolder prefixes like `video/MiniMax_H3`
+        formatted_sub = gacha._format_gacha_prefix("video/MiniMax_H3", "GachaT01_S1001", base_prefix="WebUI_b8e0b962")
+        self.assertEqual(formatted_sub, "video/WebUI_b8e0b962_MiniMax_H3_GachaT01_S1001")
 
         # 2. Test `enqueue_serverless_job` validation, sanitization, and atomic file creation
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -451,6 +521,7 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                                 "seeds": [101, 102],
                                 "take_videos": ["/content/drive/MyDrive/AI_Workstation/ComfyUI/output/TestOut_T01.mp4"],
                                 "grid_video": "/content/drive/MyDrive/AI_Workstation/ComfyUI/output/TestOut_Grid.mp4",
+                                "outputs": {"20": {"images": [{"filename": "TestOut_T01.mp4", "subfolder": "video", "type": "output"}]}},
                             }
                         )
                         return (0, json.dumps({"done": True, "rc": "0", "tail": f"Done\n{summary_json}"}))
@@ -460,6 +531,7 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                 disp_res = ctrl.dispatch_workflow_on_g4(wf_p, gacha_runs=2, prefix="TestOut")
                 self.assertEqual(disp_res["status"], "completed")
                 self.assertEqual(disp_res["expected_files"], ["TestOut_T01.mp4", "TestOut_Grid.mp4"])
+                self.assertIn("20", disp_res["outputs"])
                 self.assertEqual(ctrl.last_output_files, ["TestOut_T01.mp4", "TestOut_Grid.mp4"])
 
             # Idle check after 305s (>= 300s) triggers Drive flush check + `colab_meter.py stop -s comfy-g4`
@@ -489,4 +561,5 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

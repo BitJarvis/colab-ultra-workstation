@@ -368,24 +368,37 @@ except Exception as e:
                                 raise RuntimeError(f"❌ G4 渲染任务失败 (rc={job_rc}):\n{tail_txt}")
                             print(f"🎉 [G4-Complete] 渲染完成 (耗时 {time.time() - t0:.1f}s)！产出已写入共享云盘 output/。", flush=True)
                             expected_files: List[str] = []
+                            job_outputs: Dict[str, Any] = {}
+                            parsed_res: Optional[Dict[str, Any]] = None
                             for tline in reversed(tail_txt.splitlines()):
                                 tline_s = tline.strip()
                                 if tline_s.startswith("{") and tline_s.endswith("}"):
                                     try:
-                                        j_res = json.loads(tline_s)
-                                        for vp in j_res.get("take_videos", []) or []:
-                                            expected_files.append(Path(vp).name)
-                                        if j_res.get("grid_video"):
-                                            expected_files.append(Path(j_res["grid_video"]).name)
+                                        parsed_res = json.loads(tline_s)
                                         break
                                     except Exception:
                                         pass
+                            if parsed_res is None:
+                                m_json = re.search(r"(\{\s*\"seeds\"\s*:.*\}\s*)\Z", tail_txt, flags=re.DOTALL)
+                                if m_json:
+                                    try:
+                                        parsed_res = json.loads(m_json.group(1))
+                                    except Exception:
+                                        pass
+                            if isinstance(parsed_res, dict):
+                                for vp in parsed_res.get("take_videos", []) or []:
+                                    expected_files.append(Path(vp).name)
+                                if parsed_res.get("grid_video"):
+                                    expected_files.append(Path(parsed_res["grid_video"]).name)
+                                if isinstance(parsed_res.get("outputs"), dict):
+                                    job_outputs = parsed_res["outputs"]
                             self.last_output_files = expected_files
                             result_summary: Dict[str, Any] = {
                                 "status": "completed",
                                 "g4_session": self.g4_session,
                                 "elapsed_seconds": round(time.time() - t0, 1),
                                 "expected_files": expected_files,
+                                "outputs": job_outputs,
                                 "log_tail": tail_txt,
                             }
                             if self.auto_stop_immediately:
@@ -397,10 +410,62 @@ except Exception as e:
                             return result_summary
 
 
+def ensure_background_watcher_daemon(
+    cpu_session: str = "c6e1c7",
+    g4_session: str = "comfy-g4",
+    gpu: str = "G4",
+    profile: str = "scheme_a",
+    idle_timeout: int = 600,
+) -> Optional[int]:
+    """Ensure a background `comfy_serverless_g4_dispatcher.py watch` daemon is running on the host."""
+    sess_cpu = validate_session_name(cpu_session)
+    sess_g4 = validate_session_name(g4_session)
+    gpu_var = validate_gpu_variant(gpu)
+    check = subprocess.run(
+        ["pgrep", "-f", f"comfy_serverless_g4_dispatcher.py watch.*--cpu-session {sess_cpu}"],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode == 0 and check.stdout.strip():
+        pid = int(check.stdout.strip().splitlines()[0])
+        print(f"👀 [Serverless-Watcher] 后台队列监听守护进程已在运行 (PID={pid})", flush=True)
+        return pid
+
+    log_path = Path(f"/tmp/serverless_g4_watcher_{sess_cpu}.log")
+    log_f = open(log_path, "a")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            str( Path(__file__).resolve() ),
+            "watch",
+            "--cpu-session",
+            sess_cpu,
+            "--g4-session",
+            sess_g4,
+            "--gpu",
+            gpu_var,
+            "--profile",
+            profile,
+            "--idle-timeout",
+            str(int(idle_timeout)),
+        ],
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    print(
+        f"🚀 [Serverless-Watcher] 已自动启动后台队列监听守护进程 (PID={proc.pid}, 日志: {log_path})",
+        flush=True,
+    )
+    return proc.pid
+
+
 def launch_cpu_canvas_on_session(
     cpu_session: str = "c6e1c7",
     exec_mode: str = "g4-queue",
     refresh_nodes: bool = False,
+    start_watcher: bool = True,
 ) -> Dict[str, Any]:
     """Upload and start `launch_cpu_canvas_comfyui.py` on the free CPU Colab session and return connection info."""
     sess = validate_session_name(cpu_session)
@@ -443,6 +508,9 @@ def launch_cpu_canvas_on_session(
                 ln = ln.strip()
                 if ln.startswith("{") and ln.endswith("}"):
                     info = json.loads(ln)
+                    if start_watcher and exec_mode == "g4-queue":
+                        watcher_pid = ensure_background_watcher_daemon(cpu_session=sess)
+                        info["watcher_pid"] = watcher_pid
                     print("\n" + "=" * 72, flush=True)
                     print(f"🎨 [0.00 CCU/h 独立画布就绪] 会话: [{sess}] | 模式: {info.get('exec_mode')}", flush=True)
                     print(f"🌐 专属 ComfyUI 网页画布地址: {info.get('public_url')}", flush=True)
@@ -473,7 +541,7 @@ def watch_serverless_queue_loop(
     polls = 0
     while True:
         polls += 1
-        check_code = '''import json
+        check_code = '''import json, time
 from pathlib import Path
 q_pending = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/pending")
 q_running = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/running")
@@ -485,12 +553,20 @@ if not jobs:
 else:
     target = jobs[0]
     dst = q_running / target.name
-    target.replace(dst)
-    data = json.loads(dst.read_text(encoding="utf-8"))
+    data = json.loads(target.read_text(encoding="utf-8"))
+    data["status"] = "running"
+    data["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data["started_at_ms"] = int(time.time() * 1000)
+    dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    target.unlink(missing_ok=True)
     data["running_file"] = str(dst)
     print(json.dumps({"claimed": data}))
 '''
-        rc, out = ctrl.colab_exec(ctrl.cpu_session, check_code, timeout=20.0)
+        try:
+            rc, out = ctrl.colab_exec(ctrl.cpu_session, check_code, timeout=20.0)
+        except Exception as exc:
+            print(f"⚠️ [Serverless-Watcher] 轮询 [{ctrl.cpu_session}] 队列超时或临时异常 (将在下一轮重试): {exc}", flush=True)
+            rc, out = 1, ""
         claimed_job = None
         if rc == 0 and out:
             for ln in reversed(out.splitlines()):
@@ -513,6 +589,7 @@ else:
             tmp_wf = Path(f"/tmp/serverless_job_{job_id}.json")
             tmp_wf.write_text(json.dumps(claimed_job["prompt"], indent=2, ensure_ascii=False), encoding="utf-8")
             expected_files = []
+            job_outputs = {}
             try:
                 res = ctrl.dispatch_workflow_on_g4(
                     workflow_path=tmp_wf,
@@ -521,6 +598,7 @@ else:
                     prefix=prefix,
                 )
                 expected_files = res.get("expected_files", [])
+                job_outputs = res.get("outputs") or {}
                 mark_status = "completed"
                 err_msg = None
             except Exception as exc:
@@ -539,17 +617,26 @@ if src.exists():
     data = json.loads(src.read_text(encoding="utf-8"))
     data["status"] = {mark_status!r}
     data["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data["completed_at_ms"] = int(time.time() * 1000)
     data["expected_files"] = {expected_files!r}
+    if {job_outputs!r}:
+        data["outputs"] = {job_outputs!r}
     if {err_msg!r}:
         data["error"] = {err_msg!r}
     dst = dst_dir / src.name
     dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     src.unlink(missing_ok=True)
 '''
-            ctrl.colab_exec(ctrl.cpu_session, finalize_code, timeout=20.0)
+            try:
+                ctrl.colab_exec(ctrl.cpu_session, finalize_code, timeout=25.0)
+            except Exception as exc:
+                print(f"⚠️ [Serverless-Watcher] 回写任务状态异常: {exc}", flush=True)
         else:
             # No pending job: check if G4 should be auto-stopped due to idle timeout
-            ctrl.check_idle_and_stop_if_needed()
+            try:
+                ctrl.check_idle_and_stop_if_needed()
+            except Exception as exc:
+                print(f"⚠️ [Serverless-Watcher] 空闲释放检查异常: {exc}", flush=True)
 
         if max_polls is not None and polls >= max_polls:
             break
