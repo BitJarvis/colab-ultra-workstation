@@ -44,6 +44,13 @@ def sh(cmd):
 def mounted():
     return os.path.isdir(os.path.join(MP, "My Drive")) or os.path.isdir(os.path.join(MP, "MyDrive"))
 
+def in_mounts():
+    try:
+        with open("/proc/mounts") as f:
+            return any(parts[1] == MP for parts in (line.split() for line in f) if len(parts) > 1)
+    except OSError:
+        return False
+
 if not mounted():
     try:
         import psutil
@@ -56,9 +63,16 @@ if not mounted():
     except ImportError:
         sh('pkill -9 -x drive; pkill -9 -f "[d]fs_creds_shim.py"')
     time.sleep(1)
-    sh(f'umount -f "{MP}" 2>/dev/null; umount "{MP}" 2>/dev/null')
+    sh(f'fusermount -u "{MP}" 2>/dev/null; fusermount3 -u "{MP}" 2>/dev/null; umount -f "{MP}" 2>/dev/null; umount "{MP}" 2>/dev/null')
+    if in_mounts() or os.path.ismount(MP):
+        raise RuntimeError(f"CRITICAL SAFETY STOP: mountpoint {MP} is still mounted in /proc/mounts; refusing to touch directory!")
+    if os.path.islink(os.path.join(MP, "MyDrive")):
+        try:
+            os.unlink(os.path.join(MP, "MyDrive"))
+        except OSError:
+            pass
     if os.path.isdir(MP):
-        sh(f'rm -rf "{MP}"')
+        sh(f'rmdir "{MP}" 2>/dev/null || true')
     os.makedirs(MP, exist_ok=True)
     if CFG.get("purge_state", True):
         sh('rm -rf /root/.config/Google/DriveFS')

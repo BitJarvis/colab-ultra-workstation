@@ -15,8 +15,12 @@
 # ==============================================================================
 set -euo pipefail
 
-export https_proxy="${https_proxy:-http://127.0.0.1:7890}"
-export http_proxy="${http_proxy:-http://127.0.0.1:7890}"
+if [[ -z "${https_proxy:-}" ]] && [[ -z "${http_proxy:-}" ]]; then
+  if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 7890 >/dev/null 2>&1; then
+    export https_proxy="http://127.0.0.1:7890"
+    export http_proxy="http://127.0.0.1:7890"
+  fi
+fi
 export no_proxy="${no_proxy:-localhost,127.0.0.1}"
 
 SESSION="${SESSION:-ds_g4}"

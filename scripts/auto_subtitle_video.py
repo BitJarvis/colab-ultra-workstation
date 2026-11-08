@@ -395,7 +395,7 @@ build_subtitles_for_four_segments = build_subtitles_for_segments
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Acoustic-Aligned Subtitle & Character Intro Card Renderer")
     parser.add_argument("--config", default=None, help="Path to drama_config.json (loads lines & character cards automatically)")
-    parser.add_argument("--root", default="/Users/delroy/Documents/Playground/test001")
+    parser.add_argument("--root", default=".")
     parser.add_argument("--seg-prefix", default=None)
     parser.add_argument("--master", default=None)
     parser.add_argument("--out", default=None)

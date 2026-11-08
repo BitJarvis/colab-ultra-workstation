@@ -320,6 +320,19 @@ import torch
 LATENT_DIR = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/output/latents")
 
 
+def _safe_ckpt_path(checkpoint_name: str) -> Path:
+    base = LATENT_DIR.resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    raw_name = Path(str(checkpoint_name).strip()).name
+    if not raw_name or raw_name in (".", ".."):
+        raise ValueError(f"[H3LatentCheckpoint] Invalid checkpoint_name: {checkpoint_name!r}")
+    fname = raw_name if raw_name.endswith(".pt") else f"{raw_name}.pt"
+    candidate = (base / fname).resolve()
+    if candidate.parent != base:
+        raise ValueError(f"[H3LatentCheckpoint] Path traversal blocked: {checkpoint_name!r}")
+    return candidate
+
+
 def _to_cpu(obj):
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
@@ -349,9 +362,7 @@ class H3SaveAVLatent:
     CATEGORY = "MiniMax-H3/Checkpoint"
 
     def save_latent(self, latent, checkpoint_name):
-        LATENT_DIR.mkdir(parents=True, exist_ok=True)
-        fname = checkpoint_name if checkpoint_name.endswith(".pt") else f"{checkpoint_name}.pt"
-        out_path = LATENT_DIR / fname
+        out_path = _safe_ckpt_path(checkpoint_name)
         torch.save(_to_cpu(latent), out_path)
         print(f"[H3LatentCheckpoint] Saved AV_LATENT -> {out_path} ({out_path.stat().st_size / (1024**2):.2f} MB)", flush=True)
         return (latent,)
@@ -372,11 +383,13 @@ class H3LoadAVLatent:
     CATEGORY = "MiniMax-H3/Checkpoint"
 
     def load_latent(self, checkpoint_name):
-        fname = checkpoint_name if checkpoint_name.endswith(".pt") else f"{checkpoint_name}.pt"
-        in_path = LATENT_DIR / fname
+        in_path = _safe_ckpt_path(checkpoint_name)
         if not in_path.exists():
             raise FileNotFoundError(f"[H3LatentCheckpoint] Missing latent checkpoint on Drive: {in_path}")
-        latent = torch.load(in_path, map_location="cpu", weights_only=False)
+        try:
+            latent = torch.load(in_path, map_location="cpu", weights_only=True)
+        except Exception:
+            latent = torch.load(in_path, map_location="cpu", weights_only=False)
         print(f"[H3LatentCheckpoint] Loaded AV_LATENT <- {in_path} (0.05s hot-resume)", flush=True)
         return (latent,)
 
@@ -432,8 +445,93 @@ def wire_hybrid_models_dir() -> None:
             os.symlink(target, link_path)
 
 
+def start_caddy_auth_gateway(service_port: int = 8188, public_port: int = 18188) -> dict:
+    """Launch Caddy Dual-Mode Security Layer (Basic Auth + Cookie + Bearer Token) in front of ComfyUI before Cloudflare Tunnel."""
+    import hashlib
+    import platform
+    import secrets
+
+    work_dir = Path("/tmp/ct_comfyui")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    creds_path = work_dir / "credentials.json"
+
+    existing = {}
+    if creds_path.exists():
+        try:
+            existing = json.loads(creds_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    auth_user = os.environ.get("CT_AUTH_USER") or existing.get("auth_user") or "admin"
+    auth_pass = os.environ.get("CT_AUTH_PASS") or existing.get("auth_pass") or secrets.token_urlsafe(12)
+    api_token = os.environ.get("CT_API_TOKEN") or existing.get("api_token") or ("sk-comfy-" + secrets.token_urlsafe(20))
+
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+    if not Path("/usr/local/bin/caddy").exists():
+        print("🔒 正在安装 Caddy 安全鉴权网关 (/usr/local/bin/caddy)...", flush=True)
+        tag = json.loads(
+            urllib.request.urlopen("https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=30).read()
+        )["tag_name"]
+        tgz = "/tmp/caddy.tgz"
+        url = f"https://github.com/caddyserver/caddy/releases/download/{tag}/caddy_{tag.lstrip('v')}_linux_{arch}.tar.gz"
+        urllib.request.urlretrieve(url, tgz)
+        subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+
+    cookie_tok = hashlib.sha256(f"ct-comfy-v2:{auth_user}:{auth_pass}:{api_token}".encode()).hexdigest()
+    hashed = subprocess.check_output(["/usr/local/bin/caddy", "hash-password", "--plaintext", auth_pass], text=True).strip()
+    upstream = f"""reverse_proxy 127.0.0.1:{service_port} {{
+            header_up -Authorization
+            flush_interval -1
+        }}"""
+    caddyfile = f"""{{
+    admin off
+    auto_https off
+}}
+:{public_port} {{
+    encode zstd gzip
+    @bearer header Authorization "Bearer {api_token}"
+    handle @bearer {{
+        {upstream}
+    }}
+    @cookie header Cookie *ct_comfy_session={cookie_tok}*
+    handle @cookie {{
+        {upstream}
+    }}
+    handle {{
+        route {{
+            basic_auth {{
+                "{auth_user}" {hashed}
+            }}
+            header +Set-Cookie "ct_comfy_session={cookie_tok}; Path=/; HttpOnly; SameSite=Lax"
+            {upstream}
+        }}
+    }}
+}}
+"""
+    caddy_cfg = work_dir / "Caddyfile"
+    caddy_cfg.write_text(caddyfile, encoding="utf-8")
+    sh("pkill -f 'caddy run.*ct_comfyui' || true")
+    caddy_log = open(work_dir / "caddy.log", "a")
+    subprocess.Popen(
+        ["/usr/local/bin/caddy", "run", "--config", str(caddy_cfg), "--adapter", "caddyfile"],
+        stdout=caddy_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    creds = {
+        "service_port": service_port,
+        "public_port": public_port,
+        "auth_user": auth_user,
+        "auth_pass": auth_pass,
+        "api_token": api_token,
+    }
+    creds_path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
+    os.chmod(creds_path, 0o600)
+    return creds
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="G4 Tri-Parallel NVMe Fast Boot Launcher v2.2")
+    parser = argparse.ArgumentParser(description="G4 Tri-Parallel NVMe Fast Boot Launcher v2.2 (Hardened)")
     parser.add_argument(
         "--profile",
         choices=["scheme_a", "scheme_b", "all"],
@@ -444,6 +542,11 @@ def main() -> None:
         "--refresh-nodes",
         action="store_true",
         help="Force re-sync custom_nodes from Drive and rebuild custom_nodes_bundle.tar.gz",
+    )
+    parser.add_argument(
+        "--no-tunnel",
+        action="store_true",
+        help="Do not start public Cloudflare tunnel (local 127.0.0.1:8188 API only)",
     )
     args = parser.parse_args()
 
@@ -459,7 +562,7 @@ def main() -> None:
         drive_script_dst.parent.mkdir(parents=True, exist_ok=True)
         if Path(__file__).resolve() != drive_script_dst.resolve():
             shutil.copy2(__file__, drive_script_dst)
-            print(f"✅ 已自动同步最新 v2.2 启动引擎至云盘: {drive_script_dst}", flush=True)
+            print(f"✅ 已自动同步最新 v2.2 安全加固版启动引擎至云盘: {drive_script_dst}", flush=True)
     except Exception as exc:
         print(f"⚠️ 同步云盘启动脚本跳过: {exc}", flush=True)
 
@@ -487,13 +590,7 @@ def main() -> None:
 
     wire_hybrid_models_dir()
 
-    print("=== [3/3] 启动 ComfyUI (--highvram --disable-mmap --fast) + Cloudflare 隧道 ===", flush=True)
-    if not Path("/usr/local/bin/cloudflared").exists():
-        sh(
-            "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 "
-            "-O /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
-        )
-
+    print("=== [3/3] 启动 ComfyUI (--highvram --disable-mmap --fast) + Caddy 鉴权网关 + Cloudflare 隧道 ===", flush=True)
     sh("pkill -f 'python3 main.py' || true")
     sh("pkill -f 'cloudflared tunnel' || true")
 
@@ -515,18 +612,26 @@ def main() -> None:
         stderr=subprocess.STDOUT,
     )
 
-    cf_log = open("/tmp/cloudflared.log", "w")
-    subprocess.Popen(
-        ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8188"],
-        stdout=cf_log,
-        stderr=subprocess.STDOUT,
-    )
+    auth_creds = None
+    if not args.no_tunnel:
+        auth_creds = start_caddy_auth_gateway(service_port=8188, public_port=18188)
+        if not Path("/usr/local/bin/cloudflared").exists():
+            sh(
+                "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 "
+                "-O /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
+            )
+        cf_log = open("/tmp/cloudflared.log", "w")
+        subprocess.Popen(
+            ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:18188"],
+            stdout=cf_log,
+            stderr=subprocess.STDOUT,
+        )
 
     cf_url = None
     comfy_ready = False
     for _ in range(90):
         time.sleep(1.5)
-        if not cf_url and Path("/tmp/cloudflared.log").exists():
+        if not args.no_tunnel and not cf_url and Path("/tmp/cloudflared.log").exists():
             txt = Path("/tmp/cloudflared.log").read_text(errors="ignore")
             m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", txt)
             if m:
@@ -534,17 +639,23 @@ def main() -> None:
         if not comfy_ready and Path("/tmp/comfyui.log").exists():
             if "To see the GUI go to:" in Path("/tmp/comfyui.log").read_text(errors="ignore"):
                 comfy_ready = True
-        if cf_url and comfy_ready:
+        if (cf_url or args.no_tunnel) and comfy_ready:
             break
 
     print("\n" + "=" * 68, flush=True)
     print(
-        f"🎉 ComfyUI v2.1 (G4 96GB Blackwell 三路全并发极速模式) 已就绪: {comfy_ready} | 冷启动总耗时: {time.time() - t_boot:.1f}s",
+        f"🎉 ComfyUI v2.2 (G4 96GB Blackwell 三路全并发安全加固模式) 已就绪: {comfy_ready} | 冷启动总耗时: {time.time() - t_boot:.1f}s",
         flush=True,
     )
-    print(f"🌐 您的专属 ComfyUI 网页工作台地址: {cf_url}", flush=True)
+    if auth_creds:
+        print(f"🌐 您的专属 ComfyUI 网页工作台地址 (已开启 Caddy 双模鉴权保护): {cf_url}", flush=True)
+        print(f"🔑 网页登录账号: {auth_creds['auth_user']} | 密码: {auth_creds['auth_pass']}", flush=True)
+        print(f"🛡️ API Bearer Token: {auth_creds['api_token']} (凭证文件: /tmp/ct_comfyui/credentials.json)", flush=True)
+    else:
+        print("🔒 本地 API 监听模式: http://127.0.0.1:8188 (未暴露公网隧道)", flush=True)
     print("=" * 68, flush=True)
 
 
 if __name__ == "__main__":
     main()
+

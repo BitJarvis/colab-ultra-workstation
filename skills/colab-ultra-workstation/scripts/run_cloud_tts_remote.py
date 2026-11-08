@@ -4,7 +4,7 @@
 Follows Colab Ultra Workstation Iron Rules:
 - Uses `colab exec -s <session> -f <temp_file>` + `nohup` detached execution + `alarm 20` log polling (Iron Rule C).
 - Uses Dual-Track CCU Meter (`colab_meter.py start` / `stop`).
-- Pulls all synthesized `.wav` files back to local `/Users/delroy/Documents/Playground/test001/tts_takes/`.
+  - Pulls all synthesized `.wav` files back to local `./tts_takes/`.
 """
 
 from __future__ import annotations
@@ -13,22 +13,32 @@ import argparse
 import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path("/Users/delroy/Documents/Playground/test001")
-SCRIPTS_DIR = ROOT / "colab-ultra-workstation/scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPTS_DIR.parent
+ROOT = Path(os.environ.get("WORKSTATION_LOCAL_ROOT", str(REPO_ROOT)))
 LOCAL_TAKES_DIR = ROOT / "tts_takes"
-ARTIFACT_DIR = Path("/Users/delroy/.gemini/antigravity/brain/d4ba0448-57f4-477a-b8cc-1cb22bab61d2")
+ARTIFACT_DIR = Path(os.environ["ANTIGRAVITY_ARTIFACT_DIR"]) if os.environ.get("ANTIGRAVITY_ARTIFACT_DIR") else None
 COLAB_BIN = os.path.expanduser("~/.local/bin/colab")
 COLAB_PY = os.path.expanduser("~/.local/share/uv/tools/google-colab-cli/bin/python")
 
+
+def _is_local_port_open(port: int = 7890) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 ENV = dict(os.environ)
-ENV.setdefault("https_proxy", "http://127.0.0.1:7890")
-ENV.setdefault("http_proxy", "http://127.0.0.1:7890")
+if _is_local_port_open(7890):
+    ENV.setdefault("https_proxy", "http://127.0.0.1:7890")
+    ENV.setdefault("http_proxy", "http://127.0.0.1:7890")
 ENV.setdefault("no_proxy", "localhost,127.0.0.1")
 
 
@@ -207,7 +217,7 @@ print("TTS_PACK_START:" + json.dumps(out) + ":TTS_PACK_END")
         raw_bytes = base64.b64decode(b64_data)
         dst = LOCAL_TAKES_DIR / fname
         dst.write_bytes(raw_bytes)
-        if ARTIFACT_DIR.exists():
+        if ARTIFACT_DIR and ARTIFACT_DIR.exists():
             (ARTIFACT_DIR / fname).write_bytes(raw_bytes)
         print(f"📥 已拉取至本地: {dst.name} ({len(raw_bytes) / 1024:.1f} KB)", flush=True)
 

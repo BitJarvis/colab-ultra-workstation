@@ -641,6 +641,12 @@ def main() -> None:
     parser.add_argument("--only-seg", type=int, default=None, help="Hot-swap only segment N (~3 min)")
     parser.add_argument("--start-seg", type=int, default=1)
     parser.add_argument("--end-seg", type=int, default=None)
+    parser.add_argument("--gacha-runs", type=int, default=1, help="Multi-seed batch gacha count (e.g. 4 for 2x2 comparison grid)")
+    parser.add_argument("--seed-base", type=int, default=2026110801, help="Starting seed for batch gacha")
+    parser.add_argument("--seeds", default=None, help="Explicit comma-separated seed list for batch gacha, e.g. '101,202,303,404'")
+    parser.add_argument("--gcs-bucket", default=None, help="Optional GCS URI (gs://bucket/prefix) to auto-sync generated MP4s & grids")
+    parser.add_argument("--gcp-project", default=None, help="Optional GCP project ID for GCS sync")
+    parser.add_argument("--gcp-sa-json", default=None, help="Optional GCP Service Account JSON path for GCS sync")
     args = parser.parse_args()
 
     t_start = time.time()
@@ -669,8 +675,62 @@ def main() -> None:
     # Stage only the active LoadImage / LoadAudio files required by the sliced graph
     sync_inputs_to_local_ssd(wf)
 
-    submit_and_wait(wf, f"MiniMax-H3 Seg[{start_s}..{end_s}] ({prefix})")
-    stitch_available_segments(prefix, out_mp4, expected_segs=expected_segs, output_subdir=output_subdir)
+    is_gacha = (args.gacha_runs and args.gacha_runs > 1) or bool(args.seeds)
+    synced_outputs: List[Path] = []
+    if is_gacha:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+        sys.path.insert(0, "/tmp")
+        from comfy_gacha_and_gcp import (
+            mutate_workflow_for_gacha_take,
+            parse_seed_list,
+            render_gacha_comparison_grid,
+        )
+
+        seeds = parse_seed_list(args.seeds, seed_base=args.seed_base, gacha_runs=args.gacha_runs)
+        print(f"🎰 启动双人对手戏多卡连抽模式 (共 {len(seeds)} 组 Seed: {seeds})...", flush=True)
+        for idx, seed_val in enumerate(seeds, start=1):
+            take_prefix = f"{prefix}_GachaT{idx:02d}_S{seed_val}"
+            take_wf, _ = mutate_workflow_for_gacha_take(
+                wf,
+                take_idx=idx,
+                take_seed=seed_val,
+                target_seg_id=args.only_seg,
+            )
+            submit_and_wait(take_wf, f"Drama Gacha #{idx}/{len(seeds)} (seed={seed_val})")
+            take_mp4_name = f"{take_prefix}_Master.mp4"
+            stitched = stitch_available_segments(
+                take_prefix,
+                take_mp4_name,
+                expected_segs=[args.only_seg] if args.only_seg else expected_segs,
+                output_subdir=output_subdir,
+            )
+            if stitched and stitched.exists():
+                synced_outputs.append(stitched)
+
+        if len(synced_outputs) >= 2:
+            drv_out_dir = (DRIVE_COMFY / "output" / output_subdir) if output_subdir else (DRIVE_COMFY / "output")
+            grid_p = drv_out_dir / f"{prefix}_Gacha_{len(synced_outputs)}way_Grid.mp4"
+            render_gacha_comparison_grid(synced_outputs, grid_p, seeds=seeds, tile_w=960, tile_h=540)
+            if grid_p.exists():
+                synced_outputs.append(grid_p)
+    else:
+        submit_and_wait(wf, f"MiniMax-H3 Seg[{start_s}..{end_s}] ({prefix})")
+        stitched = stitch_available_segments(prefix, out_mp4, expected_segs=expected_segs, output_subdir=output_subdir)
+        if stitched and stitched.exists():
+            synced_outputs.append(stitched)
+
+    if args.gcs_bucket and synced_outputs:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+        sys.path.insert(0, "/tmp")
+        from comfy_gacha_and_gcp import gcs_sync_directory_or_files
+
+        gcs_sync_directory_or_files(
+            synced_outputs,
+            gcs_uri=args.gcs_bucket,
+            direction="push",
+            service_account_json=args.gcp_sa_json,
+            project_id=args.gcp_project,
+        )
 
     print(f"🎉 ALL_V25_DONE (总用时 {time.time() - t_start:.1f}s)", flush=True)
 
