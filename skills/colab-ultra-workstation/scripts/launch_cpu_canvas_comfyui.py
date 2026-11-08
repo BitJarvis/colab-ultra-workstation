@@ -711,6 +711,10 @@ def _sync_queue_transitions_from_drive_api() -> None:
                     cloud_st = _QUEUE_FOLDER_IDS[pid]
                     break
             seen_names.add(jname)
+            if (QUEUE_ROOT / "completed" / jname).exists() or (QUEUE_ROOT / "failed" / jname).exists():
+                for stale_st in ("pending", "running"):
+                    (QUEUE_ROOT / stale_st / jname).unlink(missing_ok=True)
+                continue
             target_local = (QUEUE_ROOT / cloud_st / jname) if cloud_st else None
             need_pull = False
             if cloud_st in ("running", "completed", "failed") and (
@@ -960,27 +964,53 @@ async def _watch_queue_state_loop(app: web.Application) -> None:
 
 
 async def handle_serverless_status(request: web.Request) -> web.Response:
-    counts = {{}}
+    by_state = _scan_all_serverless_jobs()
+    counts = {{st: len(by_state[st]) for st in ("pending", "running", "completed", "failed")}}
     recent = []
     for st in ("pending", "running", "completed", "failed"):
-        files = sorted((QUEUE_ROOT / st).glob("job_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        counts[st] = len(files)
-        for f in files[:5]:
+        items = sorted(by_state[st], key=lambda item: int(item[1].get("timestamp_ms") or 0), reverse=True)
+        for f, data in items[:5]:
+            recent.append({{
+                "job_id": data.get("job_id"),
+                "status": st,
+                "created_at": data.get("created_at"),
+                "completed_at": data.get("completed_at"),
+                "expected_files": data.get("expected_files", []),
+                "file": f.name,
+            }})
+
+    rt_state: dict = {{}}
+    for rt_cand in (Path("/tmp/ct_comfyui/g4_runtime_state.json"), QUEUE_ROOT / "g4_runtime_state.json"):
+        if rt_cand.exists():
             try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                recent.append({{
-                    "job_id": data.get("job_id"),
-                    "status": st,
-                    "created_at": data.get("created_at"),
-                    "completed_at": data.get("completed_at"),
-                    "expected_files": data.get("expected_files", []),
-                    "file": f.name,
-                }})
+                rt_state = json.loads(rt_cand.read_text(encoding="utf-8"))
+                break
             except Exception:
                 pass
+
+    g4_state = str(rt_state.get("g4_state") or "stopped")
+    if counts.get("running", 0) > 0 and g4_state in ("stopped", "ready_warm"):
+        g4_state = "executing"
+    elif counts.get("pending", 0) > 0 and g4_state == "stopped":
+        g4_state = "booting"
+
+    last_act = float(rt_state.get("last_activity_ts") or 0.0)
+    if g4_state == "ready_warm" and last_act > 0:
+        idle_seconds = round(max(0.0, time.time() - last_act), 1)
+    else:
+        idle_seconds = float(rt_state.get("idle_seconds") or 0.0) if g4_state == "ready_warm" else 0.0
+    idle_timeout_seconds = int(rt_state.get("idle_timeout_seconds") or 600)
+
     return web.json_response({{
         "exec_mode": EXEC_MODE,
         "queue_root": str(QUEUE_ROOT),
+        "g4_session": rt_state.get("g4_session", "comfy-g4"),
+        "g4_state": g4_state,
+        "idle_seconds": idle_seconds,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "auto_start_enabled": bool(rt_state.get("auto_start_enabled", True)),
+        "auto_stop_enabled": bool(rt_state.get("auto_stop_enabled", True)),
+        "g4_runtime": rt_state,
         "counts": counts,
         "recent_jobs": recent[:10],
     }})
@@ -1329,6 +1359,79 @@ def start_caddy_auth_gateway(service_port: int = 8189, public_port: int = 18188,
     return creds
 
 
+def ensure_cloud_autonomous_watcher_on_cpu_vm(
+    cpu_session: str = "c6e1c7",
+    g4_session: str = "comfy-g4",
+    idle_timeout: int = 600,
+) -> Optional[int]:
+    """Ensure `google-colab-cli` + `colab-dfs-ext` and `comfy_serverless_g4_dispatcher.py watch` are running inside the CPU Canvas VM."""
+    # Ensure helper scripts exist in `/content/` (copying from `/content/drive/MyDrive/AI_Workstation/scripts/` if needed)
+    for sname in ("comfy_serverless_g4_dispatcher.py", "colab_meter.py", "launch_g4_comfyui_fast.py", "comfy_gacha_and_gcp.py"):
+        local_s = Path("/content") / sname
+        drive_s = DRIVE_WORKSTATION / "scripts" / sname
+        if not local_s.exists() and drive_s.exists():
+            try:
+                shutil.copy2(drive_s, local_s)
+            except Exception:
+                pass
+        elif local_s.exists() and drive_s.parent.exists():
+            try:
+                if local_s.resolve() != drive_s.resolve():
+                    shutil.copy2(local_s, drive_s)
+            except Exception:
+                pass
+
+    if not shutil.which("colab"):
+        sh("uv pip install --system -q google-colab-cli socksio || pip install -q google-colab-cli socksio")
+    if not Path("/root/.colab-dfs-ext").exists():
+        sh("curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh")
+
+    disp_script = Path("/content/comfy_serverless_g4_dispatcher.py")
+    if not disp_script.exists():
+        alt = Path(__file__).resolve().parent / "comfy_serverless_g4_dispatcher.py"
+        if alt.exists():
+            disp_script = alt
+        else:
+            return None
+
+    try:
+        out_pids = subprocess.getoutput("pgrep -f 'comfy_serverless_g4_dispatcher.py watch'")
+        for raw_pid in out_pids.splitlines():
+            raw_pid = raw_pid.strip()
+            if raw_pid.isdigit():
+                pid_int = int(raw_pid)
+                if pid_int != os.getpid():
+                    try:
+                        os.kill(pid_int, 9)
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    w_log = open(f"/tmp/serverless_g4_watcher_{cpu_session}.log", "a")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            str(disp_script),
+            "watch",
+            "--cpu-session",
+            cpu_session,
+            "--g4-session",
+            g4_session,
+            "--idle-timeout",
+            str(int(idle_timeout)),
+        ],
+        stdout=w_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    print(
+        f"🚀 [Cloud-Autonomous-Watcher] 已在 CPU 画布实例内部启动 G4 自动启停守护进程 (PID={proc.pid}, idle_timeout={idle_timeout}s)",
+        flush=True,
+    )
+    return proc.pid
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Zero-Cost CPU ComfyUI Canvas Launcher (`--cpu`) + On-Demand G4 Serverless Queue Bridge"
@@ -1338,6 +1441,22 @@ def main() -> None:
         choices=["g4-queue", "local-cpu"],
         default="g4-queue",
         help="Execution mode when clicking 'Queue Prompt' in Web UI: 'g4-queue' (default, saves job to Drive queue for G4 dispatcher) or 'local-cpu'",
+    )
+    parser.add_argument(
+        "--cpu-session",
+        default="c6e1c7",
+        help="Colab CPU session name (default: c6e1c7)",
+    )
+    parser.add_argument(
+        "--g4-session",
+        default="comfy-g4",
+        help="Colab G4 GPU session name for on-demand auto-start and idle auto-stop (default: comfy-g4)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=600,
+        help="Idle timeout in seconds before automatically stopping/releasing G4 (default: 600s = 10m)",
     )
     parser.add_argument(
         "--refresh-nodes",
@@ -1401,6 +1520,14 @@ def main() -> None:
         queue_dir=SERVERLESS_QUEUE_DIR,
     )
 
+    cloud_watcher_pid = None
+    if args.exec_mode == "g4-queue":
+        cloud_watcher_pid = ensure_cloud_autonomous_watcher_on_cpu_vm(
+            cpu_session=args.cpu_session,
+            g4_session=args.g4_session,
+            idle_timeout=args.idle_timeout,
+        )
+
     auth_creds = None
     cf_url = None
     if not args.no_tunnel:
@@ -1455,6 +1582,8 @@ def main() -> None:
         "boot_seconds": round(time.time() - t_boot, 1),
         "public_url": cf_url,
         "queue_dir": str(SERVERLESS_QUEUE_DIR),
+        "idle_timeout_seconds": args.idle_timeout,
+        "cloud_watcher_pid": cloud_watcher_pid,
         "auth_user": auth_creds["auth_user"] if auth_creds else None,
         "auth_pass": auth_creds["auth_pass"] if auth_creds else None,
         "api_token": auth_creds["api_token"] if auth_creds else None,

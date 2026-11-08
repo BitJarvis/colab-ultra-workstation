@@ -576,6 +576,93 @@ class TestWorkstationSecurityAndGacha(unittest.TestCase):
                 self.assertTrue(pending_names[0].endswith("_jobA.json"))
                 self.assertTrue(pending_names[1].endswith("_jobB.json"))
                 self.assertTrue(pending_names[2].endswith("_jobC.json"))
+
+            # 6. Test cloud-autonomous `write_runtime_state`, `_local_cpu_vm` execution, and timeout resilience
+            with tempfile.TemporaryDirectory() as tmpdir:
+                state_dir = Path(tmpdir)
+                orig_local_sf = disp.G4_LOCAL_STATE_FILE
+                orig_drive_sf = disp.G4_DRIVE_STATE_FILE
+                disp.G4_LOCAL_STATE_FILE = state_dir / "local_g4_state.json"
+                disp.G4_DRIVE_STATE_FILE = state_dir / "drive_g4_state.json"
+                try:
+                    local_ctrl = disp.ServerlessG4LifecycleController(
+                        g4_session="comfy-g4",
+                        cpu_session="c6e1c7",
+                        gpu_variant="G4",
+                        idle_timeout_sec=600,
+                    )
+                    local_ctrl._local_cpu_vm = True
+
+                    # Verify `write_runtime_state` persists all required fields for `/serverless/status`
+                    local_ctrl.g4_active = True
+                    rt_booting = local_ctrl.write_runtime_state("booting", {"note": "cold_start"})
+                    self.assertEqual(rt_booting["g4_state"], "booting")
+                    self.assertTrue(rt_booting["g4_active"])
+                    self.assertEqual(rt_booting["idle_timeout_seconds"], 600)
+                    self.assertTrue(rt_booting["auto_start_enabled"])
+                    self.assertTrue(rt_booting["auto_stop_enabled"])
+                    self.assertTrue(disp.G4_LOCAL_STATE_FILE.exists())
+                    self.assertTrue(disp.G4_DRIVE_STATE_FILE.exists())
+
+                    local_ctrl.last_activity_ts = disp.time.time() - 42.0
+                    rt_warm = local_ctrl.write_runtime_state("ready_warm")
+                    self.assertEqual(rt_warm["g4_state"], "ready_warm")
+                    self.assertGreaterEqual(rt_warm["idle_seconds"], 40.0)
+
+                    local_ctrl.g4_active = False
+                    rt_stopped = local_ctrl.write_runtime_state("stopped")
+                    self.assertEqual(rt_stopped["g4_state"], "stopped")
+                    self.assertFalse(rt_stopped["g4_active"])
+                    self.assertEqual(rt_stopped["idle_seconds"], 0.0)
+
+                    # Verify `_local_cpu_vm=True` executes `cpu_session` commands via `sys.executable -c` instead of `colab exec`
+                    rc_loc, out_loc = local_ctrl.colab_exec("c6e1c7", "print('LOCAL_VM_EXEC_OK')", timeout=5.0)
+                    self.assertEqual(rc_loc, 0)
+                    self.assertIn("LOCAL_VM_EXEC_OK", out_loc)
+
+                    src_f = state_dir / "src.txt"
+                    dst_f = state_dir / "dst.txt"
+                    src_f.write_text("hello_local_vm", encoding="utf-8")
+                    local_ctrl.colab_upload("c6e1c7", src_f, str(dst_f))
+                    self.assertEqual(dst_f.read_text(encoding="utf-8"), "hello_local_vm")
+
+                    # Verify `colab_exec` and `is_session_alive` gracefully survive `subprocess.TimeoutExpired`
+                    def timeout_runner(cmd, stdin_text=None, timeout=60.0):
+                        import subprocess as _sp
+                        raise _sp.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+                    local_ctrl._runner = timeout_runner
+                    rc_to, out_to = local_ctrl.colab_exec("comfy-g4", "print(1)", timeout=1.0)
+                    self.assertEqual(rc_to, 124)
+                    self.assertEqual(out_to, "TIMEOUT")
+                    self.assertFalse(local_ctrl.is_session_alive("comfy-g4"))
+
+                    # Verify `sync_colab_cli_to_cpu_session` syncs credentials with 0600 permissions and never touches Drive
+                    fake_cfg = state_dir / "colab-cli"
+                    fake_cfg.mkdir(parents=True, exist_ok=True)
+                    (fake_cfg / "sessions.json").write_text('{"c6e1c7": {}}', encoding="utf-8")
+                    (fake_cfg / "dfs_credentials.json").write_text('{"refresh_token": "sec"}', encoding="utf-8")
+                    captured_exec = []
+                    local_ctrl._local_cpu_vm = False
+                    local_ctrl._runner = lambda cmd, stdin_text=None, timeout=60.0: (
+                        captured_exec.append((cmd, stdin_text)),
+                        (0, '{"ok": true}'),
+                    )[1]
+                    sync_res = disp.sync_colab_cli_to_cpu_session(local_ctrl, cpu_session="c6e1c7", local_config_dir=fake_cfg)
+                    self.assertIn("sessions.json", sync_res["synced_files"])
+                    self.assertIn("dfs_credentials.json", sync_res["synced_files"])
+                    self.assertTrue(any("0o600" in (s or "") and "/root/.config/colab-cli" in (s or "") for _, s in captured_exec))
+                finally:
+                    disp.G4_LOCAL_STATE_FILE = orig_local_sf
+                    disp.G4_DRIVE_STATE_FILE = orig_drive_sf
+
+            # 7. Verify G4 in-VM idle self-destruct timer & CPU Canvas autonomous watcher hooks exist in source
+            self.assertIn("def _self_unassign_g4", g4_src)
+            self.assertIn("def _discover_tbe_runtime_addr", g4_src)
+            self.assertIn("def ensure_cloud_autonomous_watcher_on_cpu_vm", cpu_src)
+            self.assertIn('"g4_state": g4_state', cpu_src)
+            self.assertIn('"auto_start_enabled":', cpu_src)
+            self.assertIn('"auto_stop_enabled":', cpu_src)
         finally:
             disp.time.sleep = orig_sleep
 

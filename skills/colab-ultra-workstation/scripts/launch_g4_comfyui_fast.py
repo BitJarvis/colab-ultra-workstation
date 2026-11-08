@@ -659,11 +659,12 @@ def start_caddy_auth_gateway(service_port: int = 8188, public_port: int = 18188)
     return creds
 
 
-def start_g4_local_queue_worker_daemon(comfy_port: int = 8188) -> None:
-    """Start a persistent self-driven queue worker inside the G4 VM so `serverless_queue/pending` jobs are consumed even without a host watcher."""
+def start_g4_local_queue_worker_daemon(comfy_port: int = 8188, idle_timeout: int = 600) -> None:
+    """Start a persistent self-driven queue worker inside the G4 VM with an in-VM idle self-destruct timer (`--idle-timeout`)."""
     worker_script = Path("/tmp/g4_local_queue_worker.py")
     worker_code = f'''#!/usr/bin/env python3
-"""In-VM Serverless Queue Consumer for G4 (`comfy-g4`) with Drive v3 API + FUSE Dual Discovery & Input Image Sync."""
+"""In-VM Serverless Queue Consumer & Idle Self-Destruct Guardian for G4 (`comfy-g4`)."""
+import argparse
 import json
 import os
 import subprocess
@@ -674,6 +675,7 @@ import urllib.request
 from pathlib import Path
 
 QUEUE_ROOT = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue")
+STATE_FILE = QUEUE_ROOT / "g4_runtime_state.json"
 INPUT_ROOT = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/input")
 GACHA_SCRIPT = Path("/content/comfy_gacha_and_gcp.py")
 if not GACHA_SCRIPT.exists():
@@ -694,6 +696,105 @@ def _get_token() -> str:
         headers={{"Metadata-Flavor": "Google"}},
     )
     return json.loads(urllib.request.urlopen(req, timeout=4).read().decode())["access_token"]
+
+
+def _discover_tbe_runtime_addr() -> str | None:
+    addr = os.environ.get("TBE_RUNTIME_ADDR")
+    if addr:
+        return addr
+    try:
+        raw_env = Path("/proc/1/environ").read_bytes().split(b"\\x00")
+        for item in raw_env:
+            if item.startswith(b"TBE_RUNTIME_ADDR="):
+                return item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    return "172.28.0.1:8011"
+
+
+def _verify_drive_flush(expected_files: list[str]) -> bool:
+    if not expected_files:
+        return True
+    try:
+        tok = _get_token()
+        params = urllib.parse.urlencode({{
+            "q": "trashed = false and (name contains '.mp4' or name contains '.pt' or name contains '.png')",
+            "fields": "files(name,size)",
+            "pageSize": 100,
+        }})
+        req = urllib.request.Request(
+            f"https://www.googleapis.com/drive/v3/files?{{params}}",
+            headers={{"Authorization": f"Bearer {{tok}}"}},
+        )
+        files = json.loads(urllib.request.urlopen(req, timeout=8).read().decode()).get("files", [])
+        cloud_names = {{f["name"] for f in files if int(f.get("size", 0)) > 0}}
+        return all(Path(f).name in cloud_names for f in expected_files)
+    except Exception:
+        return False
+
+
+def _is_comfy_locally_busy() -> bool:
+    if Path("/tmp/g4_busy.lock").exists():
+        return True
+    try:
+        raw = urllib.request.urlopen("http://127.0.0.1:{comfy_port}/queue", timeout=2).read().decode("utf-8")
+        q = json.loads(raw)
+        if (q.get("queue_running") or []) or (q.get("queue_pending") or []):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _update_drive_runtime_state(g4_state: str, idle_sec: float, idle_timeout: int, extra: dict | None = None) -> None:
+    try:
+        now = time.time()
+        payload = {{
+            "g4_session": "comfy-g4",
+            "cpu_session": "c6e1c7",
+            "gpu_variant": "G4",
+            "g4_state": g4_state,
+            "g4_active": g4_state != "stopped",
+            "idle_seconds": round(max(0.0, idle_sec), 1) if g4_state == "ready_warm" else 0.0,
+            "idle_timeout_seconds": int(idle_timeout),
+            "last_activity_ts": round(now - idle_sec, 2),
+            "auto_start_enabled": True,
+            "auto_stop_enabled": True,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "updated_at_ms": int(now * 1000),
+        }}
+        if extra:
+            payload.update(extra)
+        STATE_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _self_unassign_g4(idle_for: float, idle_timeout: int, last_files: list[str]) -> None:
+    print(
+        f"🛑 [G4-Idle-SelfDestruct] G4 实例已连续空闲 {{int(idle_for)}}s (阈值 {{idle_timeout}}s)，正在核验云盘落盘并触发自释放...",
+        flush=True,
+    )
+    for _ in range(5):
+        if _verify_drive_flush(last_files):
+            break
+        time.sleep(2)
+    _update_drive_runtime_state(
+        "stopped",
+        0.0,
+        idle_timeout,
+        {{"last_stop_reason": f"g4_in_vm_idle_{{int(idle_for)}}s_exceeded_{{idle_timeout}}s"}},
+    )
+    try:
+        from google.colab import runtime  # type: ignore
+        runtime.unassign()
+        return
+    except Exception:
+        pass
+    addr = _discover_tbe_runtime_addr()
+    if addr:
+        req = urllib.request.Request(f"http://{{addr}}/unassign", method="POST")
+        urllib.request.urlopen(req, timeout=5)
 
 
 def _sync_pending_from_drive_api() -> None:
@@ -782,6 +883,15 @@ def _ensure_workflow_inputs_synced(prompt: dict) -> None:
 
 
 def _claim_next_job() -> tuple[Path, dict] | None:
+    if _is_comfy_locally_busy():
+        return None
+    if STATE_FILE.exists():
+        try:
+            rt = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if rt.get("watcher_pid") and (int(time.time() * 1000) - int(rt.get("updated_at_ms") or 0)) < 120000:
+                return None
+        except Exception:
+            pass
     _sync_pending_from_drive_api()
     jobs = sorted((QUEUE_ROOT / "pending").glob("job_*.json"), key=lambda p: p.name)
     for target in jobs:
@@ -805,17 +915,38 @@ def _claim_next_job() -> tuple[Path, dict] | None:
 
 
 def main() -> None:
-    print("🚀 [G4-Queue-Worker] G4 实例内置队列消费守护进程已启动...", flush=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--idle-timeout", type=int, default={int(idle_timeout)})
+    args = ap.parse_args()
+    idle_limit = int(args.idle_timeout)
+    last_active_ts = time.time()
+    last_files: list[str] = []
+    print(f"🚀 [G4-Queue-Worker] G4 实例内置队列消费与空闲自毁守护进程已启动 (idle_timeout={{idle_limit}}s)...", flush=True)
     while True:
         try:
             # Wait until local ComfyUI 8188 is ready
             urllib.request.urlopen("http://127.0.0.1:{comfy_port}/system_stats", timeout=2)
+            if Path("/tmp/g4_last_activity.ts").exists():
+                try:
+                    ext_ts = float(Path("/tmp/g4_last_activity.ts").read_text().strip())
+                    if ext_ts > last_active_ts:
+                        last_active_ts = ext_ts
+                except Exception:
+                    pass
+            if _is_comfy_locally_busy() or list((QUEUE_ROOT / "running").glob("job_*.json")):
+                last_active_ts = time.time()
+
             claimed = _claim_next_job()
             if not claimed:
+                idle_for = time.time() - last_active_ts
+                if idle_limit > 0 and idle_for >= idle_limit and not _is_comfy_locally_busy():
+                    _self_unassign_g4(idle_for, idle_limit, last_files)
                 time.sleep(3)
                 continue
+            last_active_ts = time.time()
             running_file, job = claimed
             job_id = str(job.get("job_id") or job.get("prompt_id") or "job")
+            _update_drive_runtime_state("executing", 0.0, idle_limit, {{"current_job_id": job_id}})
             gacha_runs = max(1, int(job.get("gacha_runs") or 1))
             seed_base = job.get("seed_base")
             prefix = job.get("prefix") or f"WebUI_{{job_id[:8]}}"
@@ -844,6 +975,7 @@ def main() -> None:
             print(f"🎬 [G4-Queue-Worker] 开始执行任务 {{job_id}} (gacha_runs={{gacha_runs}})...", flush=True)
             proc = subprocess.run(cmd, text=True, capture_output=True)
             tmp_wf.unlink(missing_ok=True)
+            last_active_ts = time.time()
             out_txt = (proc.stdout or "") + "\\n" + (proc.stderr or "")
             if proc.returncode == 0:
                 parsed = {{}}
@@ -858,6 +990,7 @@ def main() -> None:
                 expected_files = [Path(vp).name for vp in (parsed.get("take_videos") or [])]
                 if parsed.get("grid_video"):
                     expected_files.append(Path(parsed["grid_video"]).name)
+                last_files = expected_files
                 job["status"] = "completed"
                 job["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 job["completed_at_ms"] = int(time.time() * 1000)
@@ -867,6 +1000,7 @@ def main() -> None:
                 dst = QUEUE_ROOT / "completed" / running_file.name
                 dst.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
                 running_file.unlink(missing_ok=True)
+                _update_drive_runtime_state("ready_warm", 0.0, idle_limit)
                 print(f"🎉 [G4-Queue-Worker] 任务 {{job_id}} 完成: {{expected_files}}", flush=True)
             else:
                 job["status"] = "failed"
@@ -876,6 +1010,7 @@ def main() -> None:
                 dst = QUEUE_ROOT / "failed" / running_file.name
                 dst.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
                 running_file.unlink(missing_ok=True)
+                _update_drive_runtime_state("ready_warm", 0.0, idle_limit)
                 print(f"❌ [G4-Queue-Worker] 任务 {{job_id}} 失败: {{out_txt[-400:]}}", flush=True)
         except Exception:
             time.sleep(3)
@@ -888,7 +1023,7 @@ if __name__ == "__main__":
     sh("pkill -f '/tmp/g4_local_queue_worker.py' || true")
     w_log = open("/tmp/g4_local_queue_worker.log", "a")
     subprocess.Popen(
-        [sys.executable, "-u", str(worker_script)],
+        [sys.executable, "-u", str(worker_script), "--idle-timeout", str(int(idle_timeout))],
         stdout=w_log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -912,6 +1047,12 @@ def main() -> None:
         "--no-tunnel",
         action="store_true",
         help="Do not start public Cloudflare tunnel (local 127.0.0.1:8188 API only)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=int,
+        default=600,
+        help="In-VM idle self-destruct timeout in seconds (default: 600s = 10m; 0 disables in-VM timer)",
     )
     args = parser.parse_args()
 
@@ -978,7 +1119,7 @@ def main() -> None:
         stderr=subprocess.STDOUT,
     )
 
-    start_g4_local_queue_worker_daemon(comfy_port=8188)
+    start_g4_local_queue_worker_daemon(comfy_port=8188, idle_timeout=args.idle_timeout)
 
     auth_creds = None
     if not args.no_tunnel:

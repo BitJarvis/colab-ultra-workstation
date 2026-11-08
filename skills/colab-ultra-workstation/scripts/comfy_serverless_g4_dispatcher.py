@@ -81,6 +81,14 @@ def validate_gpu_variant(gpu: str) -> str:
     return cleaned
 
 
+G4_LOCAL_STATE_FILE = Path("/tmp/ct_comfyui/g4_runtime_state.json")
+G4_DRIVE_STATE_FILE = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/g4_runtime_state.json")
+
+
+def _is_running_inside_colab_vm() -> bool:
+    return Path("/content").is_dir() and bool(os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("TBE_RUNTIME_ADDR"))
+
+
 class ServerlessG4LifecycleController:
     """Manages on-demand G4 GPU provisioning, job dispatch, Drive flush verification, and idle auto-stop."""
 
@@ -106,8 +114,50 @@ class ServerlessG4LifecycleController:
         self.auto_stop_immediately = bool(auto_stop_immediately)
         self._runner = runner or self._default_runner
         self.g4_active: bool = False
+        self.g4_state: str = "stopped"
         self.last_activity_ts: float = 0.0
         self.last_output_files: List[str] = []
+        self.current_job_id: Optional[str] = None
+        self._local_cpu_vm: bool = runner is None and _is_running_inside_colab_vm()
+
+    def write_runtime_state(self, state: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Persist current G4 lifecycle status (`stopped` | `booting` | `ready_warm` | `executing`) for `/serverless/status`."""
+        if state:
+            self.g4_state = state
+        now = time.time()
+        idle_sec = round(max(0.0, now - self.last_activity_ts), 1) if (self.g4_active and self.last_activity_ts > 0 and self.g4_state == "ready_warm") else 0.0
+        payload: Dict[str, Any] = {
+            "g4_session": self.g4_session,
+            "cpu_session": self.cpu_session,
+            "gpu_variant": self.gpu_variant,
+            "profile": self.profile,
+            "g4_state": self.g4_state,
+            "g4_active": bool(self.g4_active),
+            "idle_seconds": idle_sec,
+            "idle_timeout_seconds": self.idle_timeout_sec,
+            "last_activity_ts": round(self.last_activity_ts, 2) if self.last_activity_ts > 0 else 0.0,
+            "auto_start_enabled": True,
+            "auto_stop_enabled": True,
+            "auto_stop_immediately": self.auto_stop_immediately,
+            "current_job_id": self.current_job_id,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "updated_at_ms": int(now * 1000),
+            "watcher_pid": os.getpid(),
+        }
+        if extra:
+            payload.update(extra)
+        raw = json.dumps(payload, indent=2, ensure_ascii=False)
+        for target in (G4_LOCAL_STATE_FILE, G4_DRIVE_STATE_FILE):
+            try:
+                if target == G4_DRIVE_STATE_FILE and not target.parent.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.parent / f".tmp_{target.name}"
+                tmp.write_text(raw, encoding="utf-8")
+                tmp.replace(target)
+            except Exception:
+                pass
+        return payload
 
     @staticmethod
     def _default_runner(cmd: List[str], stdin_text: Optional[str] = None, timeout: float = 120.0) -> Tuple[int, str]:
@@ -122,19 +172,35 @@ class ServerlessG4LifecycleController:
         return proc.returncode, out.strip()
 
     def colab_exec(self, session: str, python_code: str, timeout: float = 45.0) -> Tuple[int, str]:
-        """Execute a short non-blocking Python snippet on a Colab session."""
+        """Execute a short non-blocking Python snippet on a Colab session (or directly in-process if targeting local CPU VM)."""
         sess = validate_session_name(session)
-        return self._runner([COLAB_BIN, "exec", "-s", sess, "--timeout", str(timeout)], python_code, timeout + 15.0)
+        try:
+            if self._local_cpu_vm and sess == self.cpu_session:
+                return self._runner([sys.executable, "-c", python_code], None, timeout)
+            return self._runner([COLAB_BIN, "exec", "-s", sess, "--timeout", str(timeout)], python_code, timeout + 15.0)
+        except subprocess.TimeoutExpired:
+            return 124, "TIMEOUT"
 
     def colab_upload(self, session: str, local_path: Path, remote_path: str, timeout: float = 60.0) -> None:
         sess = validate_session_name(session)
+        if self._local_cpu_vm and sess == self.cpu_session:
+            dst = Path(remote_path)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if local_path.resolve() != dst.resolve():
+                shutil.copy2(local_path, dst)
+            return
         rc, out = self._runner([COLAB_BIN, "upload", "-s", sess, str(local_path), remote_path], None, timeout)
         if rc != 0:
             raise RuntimeError(f"Failed to upload {local_path} to [{sess}]:{remote_path}: {out}")
 
     def is_session_alive(self, session: str) -> bool:
         sess = validate_session_name(session)
-        rc, out = self._runner([COLAB_BIN, "sessions"], None, 25.0)
+        if self._local_cpu_vm and sess == self.cpu_session:
+            return True
+        try:
+            rc, out = self._runner([COLAB_BIN, "sessions"], None, 25.0)
+        except subprocess.TimeoutExpired:
+            return False
         if rc != 0:
             return False
         return f"[{sess}]" in out
@@ -143,6 +209,8 @@ class ServerlessG4LifecycleController:
         """Check if G4 session exists and ComfyUI (`127.0.0.1:8188`) is responding."""
         if not self.is_session_alive(self.g4_session):
             self.g4_active = False
+            if self.g4_state != "booting":
+                self.g4_state = "stopped"
             return False
         probe_code = (
             "import urllib.request\n"
@@ -155,16 +223,22 @@ class ServerlessG4LifecycleController:
         rc, out = self.colab_exec(self.g4_session, probe_code, timeout=15.0)
         ready = rc == 0 and "COMFY_READY_OK" in out
         self.g4_active = ready
+        if ready and self.g4_state not in ("executing",):
+            self.g4_state = "ready_warm"
+            if self.last_activity_ts <= 0.0:
+                self.last_activity_ts = time.time()
         return ready
 
     def ensure_g4_ready(self, boot_timeout_sec: int = 420) -> Dict[str, Any]:
         """Spin up or reuse the G4 GPU session, mount 30TB Drive, and fast-boot ComfyUI (`--highvram --disable-mmap`)."""
         if self.is_g4_comfy_ready():
             self.last_activity_ts = time.time()
+            self.write_runtime_state("ready_warm")
             print(f"⚡ [G4-Reuse] G4 算力实例 [{self.g4_session}] 已处于热显存就绪状态 (0.0s 重载)！", flush=True)
             return {"session": self.g4_session, "reused": True}
 
         t0 = time.time()
+        self.write_runtime_state("booting", {"boot_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))})
         if not self.is_session_alive(self.g4_session):
             print(f"🚀 [G4-Provision] 正在按需拉起 {self.gpu_variant} (96GB Blackwell) 算力实例: [{self.g4_session}] ...", flush=True)
             self._runner(
@@ -178,21 +252,23 @@ class ServerlessG4LifecycleController:
                 180.0,
             )
             if rc != 0:
+                self.write_runtime_state("stopped", {"last_error": f"Failed to allocate {self.gpu_variant}: {out}"})
                 raise RuntimeError(f"❌ 无法分配 {self.gpu_variant} 实例 [{self.g4_session}]: {out}")
 
         print(f"☁️ [G4-Mount] 正在为 [{self.g4_session}] 零弹窗挂载 20TB/30TB Google Drive...", flush=True)
         rc, out = self._runner([COLAB_BIN, "dfs", "mount", "-s", self.g4_session], None, 150.0)
         if rc != 0:
+            self.write_runtime_state("stopped", {"last_error": f"Failed to mount Drive on {self.g4_session}: {out}"})
             raise RuntimeError(f"❌ [{self.g4_session}] 挂载 Google Drive 失败: {out}")
 
         # Upload latest fast launcher and gacha engine
         self.colab_upload(self.g4_session, G4_LAUNCHER_SCRIPT, "/content/launch_g4_comfyui_fast.py")
         self.colab_upload(self.g4_session, GACHA_SCRIPT, "/content/comfy_gacha_and_gcp.py")
 
-        print(f"🔥 [G4-FastBoot] 启动三路全并发 NVMe 预热 (profile={self.profile})...", flush=True)
+        print(f"🔥 [G4-FastBoot] 启动三路全并发 NVMe 预热 (profile={self.profile}, idle_timeout={self.idle_timeout_sec}s)...", flush=True)
         start_code = (
             "import subprocess\n"
-            f"subprocess.Popen('nohup python3 -u /content/launch_g4_comfyui_fast.py --profile {self.profile} "
+            f"subprocess.Popen('nohup python3 -u /content/launch_g4_comfyui_fast.py --profile {self.profile} --idle-timeout {self.idle_timeout_sec} "
             "> /tmp/g4_fastboot.log 2>&1 &', shell=True)\n"
             "print('G4_FASTBOOT_STARTED')\n"
         )
@@ -201,10 +277,12 @@ class ServerlessG4LifecycleController:
         deadline = time.time() + boot_timeout_sec
         while time.time() < deadline:
             time.sleep(8)
+            self.write_runtime_state("booting", {"boot_elapsed_seconds": round(time.time() - t0, 1)})
             if self.is_g4_comfy_ready():
                 self.g4_active = True
                 self.last_activity_ts = time.time()
                 boot_dt = time.time() - t0
+                self.write_runtime_state("ready_warm", {"last_boot_seconds": round(boot_dt, 1)})
                 print(f"✅ [G4-Ready] G4 算力引擎 [{self.g4_session}] 启动就绪！总耗时: {boot_dt:.1f}s", flush=True)
                 return {"session": self.g4_session, "reused": False, "boot_seconds": round(boot_dt, 1)}
 
@@ -219,6 +297,7 @@ class ServerlessG4LifecycleController:
                 if last_line:
                     print(f"  ⏳ [G4 预热进度] {last_line[0]}", flush=True)
 
+        self.write_runtime_state("stopped", {"last_error": f"Boot timeout after {boot_timeout_sec}s"})
         raise TimeoutError(f"❌ G4 实例 [{self.g4_session}] 在 {boot_timeout_sec}s 内未能完成预热启动。")
 
     def verify_drive_flush_before_stop(self, expected_filenames: Optional[List[str]] = None) -> bool:
@@ -275,6 +354,14 @@ except Exception as e:
             45.0,
         )
         self.g4_active = False
+        self.current_job_id = None
+        self.write_runtime_state(
+            "stopped",
+            {
+                "last_stop_reason": reason,
+                "last_stopped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
         print(out, flush=True)
         return {"stopped_session": self.g4_session, "reason": reason, "meter_output": out, "rc": rc}
 
@@ -287,6 +374,7 @@ except Exception as e:
         if self.auto_stop_immediately or (self.idle_timeout_sec >= 0 and idle_for >= self.idle_timeout_sec):
             reason = "auto_stop_after_batch" if self.auto_stop_immediately else f"idle_{int(idle_for)}s_exceeded_{self.idle_timeout_sec}s"
             return self.stop_g4_session(reason=reason, expected_files=getattr(self, "last_output_files", None))
+        self.write_runtime_state("ready_warm")
         return None
 
     def dispatch_workflow_on_g4(
@@ -304,6 +392,7 @@ except Exception as e:
         gacha.ensure_api_workflow_format(wf_dict, source_hint=str(workflow_path))
 
         self.ensure_g4_ready()
+        self.write_runtime_state("executing")
         remote_wf = f"/tmp/job_{int(time.time())}_{workflow_path.name}"
         self.colab_upload(self.g4_session, workflow_path, remote_wf)
         self.colab_upload(self.g4_session, GACHA_SCRIPT, "/content/comfy_gacha_and_gcp.py")
@@ -336,7 +425,8 @@ except Exception as e:
         remote_cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
         bash_payload = f"{remote_cmd_str} > /tmp/g4_job.log 2>&1; echo $? > /tmp/g4_job.done"
         launch_code = (
-            "import os, subprocess\n"
+            "import os, subprocess, time\n"
+            "open('/tmp/g4_busy.lock', 'w').write(str(time.time()))\n"
             "if os.path.exists('/tmp/g4_job.done'):\n"
             "    os.remove('/tmp/g4_job.done')\n"
             f"subprocess.Popen(['nohup', 'bash', '-c', {bash_payload!r}], "
@@ -350,9 +440,13 @@ except Exception as e:
         while True:
             time.sleep(6)
             self.last_activity_ts = time.time()
+            self.write_runtime_state("executing", {"executing_elapsed_seconds": round(time.time() - t0, 1)})
             poll_code = (
-                "import os, subprocess\n"
+                "import os, subprocess, time\n"
+                "open('/tmp/g4_last_activity.ts', 'w').write(str(time.time()))\n"
                 "done = os.path.exists('/tmp/g4_job.done')\n"
+                "if done and os.path.exists('/tmp/g4_busy.lock'):\n"
+                "    os.remove('/tmp/g4_busy.lock')\n"
                 "rc = open('/tmp/g4_job.done').read().strip() if done else ''\n"
                 "tail = subprocess.getoutput('tail -n 15 /tmp/g4_job.log')\n"
                 "import json; print(json.dumps({'done': done, 'rc': rc, 'tail': tail}))\n"
@@ -366,7 +460,9 @@ except Exception as e:
                         if state_obj.get("done"):
                             job_rc = int(state_obj.get("rc") or 0)
                             tail_txt = state_obj.get("tail", "")
+                            self.last_activity_ts = time.time()
                             if job_rc != 0:
+                                self.write_runtime_state("ready_warm", {"last_error": tail_txt[-300:]})
                                 raise RuntimeError(f"❌ G4 渲染任务失败 (rc={job_rc}):\n{tail_txt}")
                             print(f"🎉 [G4-Complete] 渲染完成 (耗时 {time.time() - t0:.1f}s)！产出已写入共享云盘 output/。", flush=True)
                             expected_files: List[str] = []
@@ -395,6 +491,7 @@ except Exception as e:
                                 if isinstance(parsed_res.get("outputs"), dict):
                                     job_outputs = parsed_res["outputs"]
                             self.last_output_files = expected_files
+                            self.write_runtime_state("ready_warm")
                             result_summary: Dict[str, Any] = {
                                 "status": "completed",
                                 "g4_session": self.g4_session,
@@ -412,6 +509,47 @@ except Exception as e:
                             return result_summary
 
 
+def sync_colab_cli_to_cpu_session(
+    ctrl: ServerlessG4LifecycleController,
+    cpu_session: str = "c6e1c7",
+    local_config_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Install `google-colab-cli` + `colab-dfs-ext` on the CPU Canvas VM and sync `~/.config/colab-cli/` credentials (`0600`)."""
+    sess = validate_session_name(cpu_session)
+    cfg_dir = local_config_dir or (Path.home() / ".config/colab-cli")
+    import base64
+
+    encoded_files: Dict[str, str] = {}
+    for fname in ("sessions.json", "token.json", "dfs_credentials.json", "settings.json", "session_tracker.json"):
+        fpath = cfg_dir / fname
+        if fpath.exists() and fpath.is_file():
+            encoded_files[fname] = base64.b64encode(fpath.read_bytes()).decode("ascii")
+
+    bootstrap_code = f'''import base64, json, os, shutil, subprocess
+target_dir = "/root/.config/colab-cli"
+os.makedirs(target_dir, mode=0o700, exist_ok=True)
+os.chmod(target_dir, 0o700)
+files = {json.dumps(encoded_files)}
+for name, b64 in files.items():
+    p = os.path.join(target_dir, name)
+    with open(p, "wb") as f:
+        f.write(base64.b64decode(b64))
+    os.chmod(p, 0o600)
+
+if not shutil.which("colab"):
+    subprocess.run("uv pip install --system -q google-colab-cli socksio || pip install -q google-colab-cli socksio", shell=True, check=False)
+if not os.path.isdir("/root/.colab-dfs-ext"):
+    subprocess.run("curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh", shell=True, check=False)
+print(json.dumps({{"ok": bool(shutil.which("colab")), "synced_files": list(files.keys())}}))
+'''
+    rc, out = ctrl.colab_exec(sess, bootstrap_code, timeout=90.0)
+    # Upload helper scripts to `/content/` on the CPU Canvas VM so the in-VM watcher has everything locally
+    for script_path in (Path(__file__).resolve(), METER_SCRIPT, G4_LAUNCHER_SCRIPT, GACHA_SCRIPT, CPU_LAUNCHER_SCRIPT):
+        if script_path.exists():
+            ctrl.colab_upload(sess, script_path, f"/content/{script_path.name}")
+    return {"rc": rc, "output": out, "synced_files": list(encoded_files.keys())}
+
+
 def ensure_background_watcher_daemon(
     cpu_session: str = "c6e1c7",
     g4_session: str = "comfy-g4",
@@ -419,7 +557,7 @@ def ensure_background_watcher_daemon(
     profile: str = "scheme_a",
     idle_timeout: int = 600,
 ) -> Optional[int]:
-    """Ensure a background `comfy_serverless_g4_dispatcher.py watch` daemon is running on the host."""
+    """Ensure a background `comfy_serverless_g4_dispatcher.py watch` daemon is running."""
     sess_cpu = validate_session_name(cpu_session)
     sess_g4 = validate_session_name(g4_session)
     gpu_var = validate_gpu_variant(gpu)
@@ -439,7 +577,7 @@ def ensure_background_watcher_daemon(
         [
             sys.executable,
             "-u",
-            str( Path(__file__).resolve() ),
+            str(Path(__file__).resolve()),
             "watch",
             "--cpu-session",
             sess_cpu,
@@ -468,17 +606,22 @@ def launch_cpu_canvas_on_session(
     exec_mode: str = "g4-queue",
     refresh_nodes: bool = False,
     start_watcher: bool = True,
+    idle_timeout: int = 600,
 ) -> Dict[str, Any]:
     """Upload and start `launch_cpu_canvas_comfyui.py` on the free CPU Colab session and return connection info."""
     sess = validate_session_name(cpu_session)
-    ctrl = ServerlessG4LifecycleController(cpu_session=sess)
+    ctrl = ServerlessG4LifecycleController(cpu_session=sess, idle_timeout_sec=idle_timeout)
     if not ctrl.is_session_alive(sess):
         print(f"🆕 正在创建免费 0.00 CCU/h CPU 画布会话 [{sess}]...", flush=True)
         ctrl._runner([COLAB_BIN, "new", "-s", sess], None, 120.0)
         ctrl._runner([COLAB_BIN, "dfs", "mount", "-s", sess], None, 120.0)
 
+    if exec_mode == "g4-queue":
+        print(f"🔐 正在向 [{sess}] 同步 google-colab-cli + colab-dfs-ext 凭证与云端自治调度器...", flush=True)
+        sync_colab_cli_to_cpu_session(ctrl, cpu_session=sess)
+
     ctrl.colab_upload(sess, CPU_LAUNCHER_SCRIPT, "/content/launch_cpu_canvas_comfyui.py")
-    flags = f"--exec-mode {exec_mode}" + (" --refresh-nodes" if refresh_nodes else "")
+    flags = f"--exec-mode {exec_mode} --idle-timeout {int(idle_timeout)}" + (" --refresh-nodes" if refresh_nodes else "")
     start_code = (
         "import subprocess\n"
         f"subprocess.Popen('nohup python3 -u /content/launch_cpu_canvas_comfyui.py {flags} > /tmp/cpu_canvas_boot.log 2>&1 &', shell=True)\n"
@@ -510,8 +653,8 @@ def launch_cpu_canvas_on_session(
                 ln = ln.strip()
                 if ln.startswith("{") and ln.endswith("}"):
                     info = json.loads(ln)
-                    if start_watcher and exec_mode == "g4-queue":
-                        watcher_pid = ensure_background_watcher_daemon(cpu_session=sess)
+                    if start_watcher and exec_mode == "g4-queue" and not info.get("cloud_watcher_pid"):
+                        watcher_pid = ensure_background_watcher_daemon(cpu_session=sess, idle_timeout=idle_timeout)
                         info["watcher_pid"] = watcher_pid
                     print("\n" + "=" * 72, flush=True)
                     print(f"🎨 [0.00 CCU/h 独立画布就绪] 会话: [{sess}] | 模式: {info.get('exec_mode')}", flush=True)
@@ -531,15 +674,24 @@ def launch_cpu_canvas_on_session(
 
 def watch_serverless_queue_loop(
     ctrl: ServerlessG4LifecycleController,
-    poll_interval_sec: int = 8,
+    poll_interval_sec: int = 5,
     max_polls: Optional[int] = None,
 ) -> None:
     """Poll the CPU session's `/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue/pending/` and dispatch to G4 on demand."""
     print(
-        f"👀 [Serverless-Watcher] 正在监听 [{ctrl.cpu_session}] 云盘任务队列 | "
+        f"👀 [Serverless-Watcher] 正在监听 [{ctrl.cpu_session}] 云盘任务队列 (local_vm={ctrl._local_cpu_vm}) | "
         f"G4 实例: [{ctrl.g4_session}] | 空闲自动关机阈值: {ctrl.idle_timeout_sec}s",
         flush=True,
     )
+    # Initial probe to sync g4_active / g4_state if G4 is already warm when watcher starts
+    try:
+        if ctrl.is_g4_comfy_ready():
+            ctrl.write_runtime_state("ready_warm")
+        else:
+            ctrl.write_runtime_state("stopped")
+    except Exception:
+        ctrl.write_runtime_state("stopped")
+
     polls = 0
     while True:
         polls += 1
@@ -582,6 +734,7 @@ else:
 
         if claimed_job:
             job_id = claimed_job.get("job_id", "unknown")
+            ctrl.current_job_id = str(job_id)
             gacha_runs = max(1, int(claimed_job.get("gacha_runs") or 1))
             raw_seed_base = claimed_job.get("seed_base")
             seed_base: Optional[int] = int(raw_seed_base) if raw_seed_base is not None else (2026110801 if gacha_runs > 1 else None)
@@ -609,35 +762,56 @@ else:
                 err_msg = str(exc)
                 print(f"❌ [Queue-Error] 任务 {job_id} 执行失败: {err_msg}", flush=True)
             finally:
+                ctrl.current_job_id = None
                 tmp_wf.unlink(missing_ok=True)
 
             finalize_code = f'''import json, time
 from pathlib import Path
 src = Path({running_file!r})
-dst_dir = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue") / {mark_status!r}
+q_root = Path("/content/drive/MyDrive/AI_Workstation/ComfyUI/serverless_queue")
+dst_dir = q_root / {mark_status!r}
 dst_dir.mkdir(parents=True, exist_ok=True)
-if src.exists():
-    data = json.loads(src.read_text(encoding="utf-8"))
-    data["status"] = {mark_status!r}
-    data["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    data["completed_at_ms"] = int(time.time() * 1000)
-    data["expected_files"] = {expected_files!r}
-    if {job_outputs!r}:
-        data["outputs"] = {job_outputs!r}
-    if {err_msg!r}:
-        data["error"] = {err_msg!r}
-    dst = dst_dir / src.name
-    dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    src.unlink(missing_ok=True)
+cand = src
+if not cand.exists():
+    for st in ("running", "pending", "completed", "failed"):
+        p = q_root / st / src.name
+        if p.exists():
+            cand = p
+            break
+if cand.exists():
+    data = json.loads(cand.read_text(encoding="utf-8"))
+else:
+    data = {claimed_job!r}
+data["status"] = {mark_status!r}
+data["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+data["completed_at_ms"] = int(time.time() * 1000)
+data["expected_files"] = {expected_files!r}
+if {job_outputs!r}:
+    data["outputs"] = {job_outputs!r}
+if {err_msg!r}:
+    data["error"] = {err_msg!r}
+dst = dst_dir / src.name
+dst.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+for other_st in ("pending", "running", "completed", "failed"):
+    if other_st != {mark_status!r}:
+        (q_root / other_st / src.name).unlink(missing_ok=True)
 '''
             try:
                 ctrl.colab_exec(ctrl.cpu_session, finalize_code, timeout=25.0)
             except Exception as exc:
                 print(f"⚠️ [Serverless-Watcher] 回写任务状态异常: {exc}", flush=True)
+            ctrl.write_runtime_state("ready_warm" if ctrl.g4_active else "stopped")
         else:
-            # No pending job: check if G4 should be auto-stopped due to idle timeout
+            # No pending job: check if G4 is still alive (in case G4 self-unassigned) and stop if idle timeout exceeded
             try:
-                ctrl.check_idle_and_stop_if_needed()
+                if ctrl.g4_active and not ctrl.is_session_alive(ctrl.g4_session):
+                    print(f"ℹ️ [Serverless-Watcher] 检测到 G4 实例 [{ctrl.g4_session}] 已自动释放下线。", flush=True)
+                    ctrl.g4_active = False
+                    ctrl.write_runtime_state("stopped", {"last_stop_reason": "in_vm_idle_self_unassign"})
+                else:
+                    ctrl.check_idle_and_stop_if_needed()
+                    if not ctrl.g4_active:
+                        ctrl.write_runtime_state("stopped")
             except Exception as exc:
                 print(f"⚠️ [Serverless-Watcher] 空闲释放检查异常: {exc}", flush=True)
 
